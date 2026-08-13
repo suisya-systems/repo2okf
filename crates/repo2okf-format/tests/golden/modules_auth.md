@@ -13,6 +13,7 @@ sources:
   evidence_id: ev-auth
   content_hash: blake3:auth
 repo2okf:
+  output_locale: en
   claims:
   - id: validates-credentials
     text: The module validates incoming credentials.

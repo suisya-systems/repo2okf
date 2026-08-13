@@ -7,6 +7,7 @@
 
 mod core_adapter;
 mod emit;
+mod locale;
 mod model;
 mod verify;
 
@@ -18,6 +19,7 @@ pub use model::{
     RepositoryIrView, RepositorySnapshot, SemanticInventory, UsageWindow, Verification,
     concept_path,
 };
+pub use repo2okf_core::OutputLocale;
 pub use verify::{
     FreshnessMismatch, Severity, VerificationIssue, VerificationReport, VerifyOptions, verify_okf,
 };

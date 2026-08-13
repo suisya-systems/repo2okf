@@ -1,9 +1,66 @@
 //! Repository intermediate representation and evidence model.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{borrow::Cow, collections::BTreeSet, fmt, path::Path, str::FromStr};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Natural-language locale used when rendering human-readable output.
+///
+/// The locale is intentionally not stored in [`RepositoryIr`]: changing it
+/// only re-renders structured facts and never changes repository analysis.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    Hash,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputLocale {
+    /// English output.
+    #[default]
+    En,
+    /// Japanese output.
+    Ja,
+}
+
+impl OutputLocale {
+    /// Stable locale label used in configuration and output metadata.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Ja => "ja",
+        }
+    }
+}
+
+impl fmt::Display for OutputLocale {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for OutputLocale {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "en" => Ok(Self::En),
+            "ja" => Ok(Self::Ja),
+            _ => Err(format!(
+                "unsupported output locale `{value}`; expected `en` or `ja`"
+            )),
+        }
+    }
+}
 
 /// A language understood by the initial scanner set.
 #[derive(
@@ -152,6 +209,23 @@ pub enum EntityKind {
     Variable,
     /// A Markdown heading.
     Heading,
+}
+
+impl EntityKind {
+    /// Stable entity-kind label used in facts and output.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Function => "function",
+            Self::Method => "method",
+            Self::Class => "class",
+            Self::Interface => "interface",
+            Self::Type => "type",
+            Self::Enum => "enum",
+            Self::Variable => "variable",
+            Self::Heading => "heading",
+        }
+    }
 }
 
 /// One source-backed graph entity.
@@ -381,6 +455,130 @@ pub enum ClaimProvenance {
     },
 }
 
+/// Locale-neutral deterministic fact underlying a human-readable claim.
+///
+/// Source identifiers and source-language tokens are stored verbatim. A
+/// formatter can therefore select a natural language without translating or
+/// reinterpreting repository facts.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClaimFact {
+    /// A source entity is declared in a file.
+    Declaration {
+        /// Repository-relative source path.
+        path: String,
+        /// Source entity kind.
+        entity_kind: EntityKind,
+        /// Verbatim source name.
+        name: String,
+    },
+    /// A Python source entity has a docstring.
+    PythonSymbolDocstring {
+        /// Repository-relative source path.
+        path: String,
+        /// Source entity kind.
+        entity_kind: EntityKind,
+        /// Verbatim source name.
+        name: String,
+    },
+    /// A Python module has a module docstring.
+    PythonModuleDocstring {
+        /// Repository-relative source path.
+        path: String,
+    },
+}
+
+impl ClaimFact {
+    fn text(&self, locale: OutputLocale) -> String {
+        match (self, locale) {
+            (
+                Self::Declaration {
+                    path,
+                    entity_kind,
+                    name,
+                },
+                OutputLocale::En,
+            ) => format!("{} declares {} `{}`.", path, entity_kind.as_str(), name),
+            (
+                Self::Declaration {
+                    path,
+                    entity_kind,
+                    name,
+                },
+                OutputLocale::Ja,
+            ) => format!(
+                "{} では、{} `{}` が宣言されています。",
+                path,
+                entity_kind_ja_label(*entity_kind),
+                name
+            ),
+            (
+                Self::PythonSymbolDocstring {
+                    path,
+                    entity_kind,
+                    name,
+                },
+                OutputLocale::En,
+            ) => format!(
+                "{} declares {} `{}` with a Python docstring.",
+                path,
+                entity_kind.as_str(),
+                name
+            ),
+            (
+                Self::PythonSymbolDocstring {
+                    path,
+                    entity_kind,
+                    name,
+                },
+                OutputLocale::Ja,
+            ) => format!(
+                "{} で宣言された{} `{}` には、Python のドキュメント文字列があります。",
+                path,
+                entity_kind_ja_label(*entity_kind),
+                name
+            ),
+            (Self::PythonModuleDocstring { path }, OutputLocale::En) => {
+                format!("{path} has a Python module docstring.")
+            }
+            (Self::PythonModuleDocstring { path }, OutputLocale::Ja) => {
+                format!("{path} には Python モジュールのドキュメント文字列があります。")
+            }
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        let (path, name) = match self {
+            Self::Declaration { path, name, .. }
+            | Self::PythonSymbolDocstring { path, name, .. } => {
+                (path.as_str(), Some(name.as_str()))
+            }
+            Self::PythonModuleDocstring { path } => (path.as_str(), None),
+        };
+        if path.trim().is_empty() {
+            return Err("has an empty fact path");
+        }
+        if name.is_some_and(|value| value.trim().is_empty()) {
+            return Err("has an empty fact name");
+        }
+        Ok(())
+    }
+}
+
+const fn entity_kind_ja_label(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::File => "ファイル",
+        EntityKind::Function => "関数",
+        EntityKind::Method => "メソッド",
+        EntityKind::Class => "クラス",
+        EntityKind::Interface => "インターフェース",
+        EntityKind::Type => "型",
+        EntityKind::Enum => "列挙型",
+        EntityKind::Variable => "変数",
+        EntityKind::Heading => "見出し",
+    }
+}
+
 /// An evidence-bound statement suitable for semantic enrichment.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Claim {
@@ -388,6 +586,11 @@ pub struct Claim {
     pub id: String,
     /// Human-readable statement.
     pub text: String,
+    /// Locale-neutral fact for deterministic, re-renderable claims.
+    ///
+    /// This is absent on agent claims and legacy version 2 IR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact: Option<ClaimFact>,
     /// Evidence IDs supporting this claim.
     pub evidence_ids: Vec<String>,
     /// Claim origin.
@@ -395,6 +598,20 @@ pub struct Claim {
     /// Optional confidence from 0 through 100. It is not a trust score.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<u8>,
+}
+
+impl Claim {
+    /// Render this claim in the requested locale.
+    ///
+    /// Agent claims and legacy deterministic claims without a structured fact
+    /// retain their original text because translating them would require new
+    /// model inference.
+    pub fn text_for(&self, locale: OutputLocale) -> Cow<'_, str> {
+        self.fact.as_ref().map_or_else(
+            || Cow::Borrowed(self.text.as_str()),
+            |fact| Cow::Owned(fact.text(locale)),
+        )
+    }
 }
 
 /// Inventory item type accounted for by coverage.
@@ -1061,6 +1278,31 @@ impl RepositoryIr {
             if claim.confidence.is_some_and(|value| value > 100) {
                 return Err(format!("claim {} confidence exceeds 100", claim.id));
             }
+            match (&claim.provenance, &claim.fact) {
+                (ClaimProvenance::Deterministic { .. }, None) if self.schema_version >= 3 => {
+                    return Err(format!(
+                        "deterministic claim {} has no structured fact",
+                        claim.id
+                    ));
+                }
+                (ClaimProvenance::Agent { .. }, Some(_)) => {
+                    return Err(format!(
+                        "agent claim {} must not supply a deterministic fact",
+                        claim.id
+                    ));
+                }
+                (ClaimProvenance::Deterministic { .. }, Some(fact)) => {
+                    fact.validate()
+                        .map_err(|reason| format!("claim {} {reason}", claim.id))?;
+                    if claim.text != fact.text(OutputLocale::En) {
+                        return Err(format!(
+                            "deterministic claim {} text disagrees with its structured fact",
+                            claim.id
+                        ));
+                    }
+                }
+                (_, None) => {}
+            }
             for evidence_id in &claim.evidence_ids {
                 if !evidence_ids.contains(evidence_id.as_str()) {
                     return Err(format!(
@@ -1093,6 +1335,12 @@ impl RepositoryIr {
             claim.evidence_ids.dedup();
             if claim.evidence_ids.is_empty() {
                 return Err(format!("claim {} has no evidence", claim.id));
+            }
+            if matches!(claim.provenance, ClaimProvenance::Agent { .. }) && claim.fact.is_some() {
+                return Err(format!(
+                    "agent claim {} must not supply a deterministic fact",
+                    claim.id
+                ));
             }
             for evidence_id in &claim.evidence_ids {
                 if !evidence_ids.contains(evidence_id.as_str()) {
@@ -1437,10 +1685,124 @@ const fn relationship_kind_for_reference(kind: SemanticReferenceKind) -> Relatio
 #[cfg(test)]
 mod tests {
     use super::{
-        ArchitectureScope, CoverageDisposition, CoverageItem, CoverageKind, CoverageReport, Entity,
-        EntityKind, Language, SemanticCoverage, SemanticReference, SemanticReferenceKind,
-        SemanticResolution, validate_owner_graph,
+        ArchitectureScope, Claim, ClaimFact, ClaimProvenance, CoverageDisposition, CoverageItem,
+        CoverageKind, CoverageReport, Entity, EntityKind, Language, OutputLocale, SemanticCoverage,
+        SemanticReference, SemanticReferenceKind, SemanticResolution, validate_owner_graph,
     };
+
+    #[test]
+    fn output_locale_has_stable_labels_and_strict_parsing() {
+        assert_eq!(OutputLocale::default(), OutputLocale::En);
+        assert_eq!(OutputLocale::En.as_str(), "en");
+        assert_eq!(OutputLocale::Ja.to_string(), "ja");
+        assert_eq!("ja".parse(), Ok(OutputLocale::Ja));
+        assert!("fr".parse::<OutputLocale>().is_err());
+        assert_eq!(
+            serde_json::to_string(&OutputLocale::Ja).expect("locale JSON"),
+            "\"ja\""
+        );
+    }
+
+    #[test]
+    fn structured_claim_facts_render_without_translating_source_tokens() {
+        let claims = [
+            Claim {
+                id: "claim:declaration".into(),
+                text: "src/app.py declares function `greet`.".into(),
+                fact: Some(ClaimFact::Declaration {
+                    path: "src/app.py".into(),
+                    entity_kind: EntityKind::Function,
+                    name: "greet".into(),
+                }),
+                evidence_ids: vec!["evidence:declaration".into()],
+                provenance: ClaimProvenance::Deterministic {
+                    process: "test".into(),
+                },
+                confidence: Some(100),
+            },
+            Claim {
+                id: "claim:symbol-docstring".into(),
+                text: "src/app.py declares function `greet` with a Python docstring.".into(),
+                fact: Some(ClaimFact::PythonSymbolDocstring {
+                    path: "src/app.py".into(),
+                    entity_kind: EntityKind::Function,
+                    name: "greet".into(),
+                }),
+                evidence_ids: vec!["evidence:docstring".into()],
+                provenance: ClaimProvenance::Deterministic {
+                    process: "test".into(),
+                },
+                confidence: Some(100),
+            },
+            Claim {
+                id: "claim:module-docstring".into(),
+                text: "src/app.py has a Python module docstring.".into(),
+                fact: Some(ClaimFact::PythonModuleDocstring {
+                    path: "src/app.py".into(),
+                }),
+                evidence_ids: vec!["evidence:module".into()],
+                provenance: ClaimProvenance::Deterministic {
+                    process: "test".into(),
+                },
+                confidence: Some(100),
+            },
+        ];
+
+        for claim in &claims {
+            assert_eq!(claim.text_for(OutputLocale::En), claim.text);
+        }
+        assert_eq!(
+            claims[0].text_for(OutputLocale::Ja),
+            "src/app.py では、関数 `greet` が宣言されています。"
+        );
+        assert_eq!(
+            claims[1].text_for(OutputLocale::Ja),
+            "src/app.py で宣言された関数 `greet` には、Python のドキュメント文字列があります。"
+        );
+        assert_eq!(
+            claims[2].text_for(OutputLocale::Ja),
+            "src/app.py には Python モジュールのドキュメント文字列があります。"
+        );
+    }
+
+    #[test]
+    fn unstructured_claim_text_is_preserved_for_every_locale() {
+        let claim = Claim {
+            id: "claim:agent".into(),
+            text: "Agent-authored text".into(),
+            fact: None,
+            evidence_ids: vec!["evidence:agent".into()],
+            provenance: ClaimProvenance::Agent {
+                provider: "test".into(),
+                model: None,
+            },
+            confidence: None,
+        };
+
+        assert_eq!(claim.text_for(OutputLocale::En), "Agent-authored text");
+        assert_eq!(claim.text_for(OutputLocale::Ja), "Agent-authored text");
+    }
+
+    #[test]
+    fn legacy_claims_deserialize_without_structured_facts() {
+        let claim: Claim = serde_json::from_value(serde_json::json!({
+            "id": "claim:legacy",
+            "text": "Legacy deterministic text.",
+            "evidence_ids": ["evidence:legacy"],
+            "provenance": {
+                "kind": "deterministic",
+                "process": "legacy"
+            },
+            "confidence": 100
+        }))
+        .expect("legacy claim");
+
+        assert_eq!(claim.fact, None);
+        assert_eq!(
+            claim.text_for(OutputLocale::Ja),
+            "Legacy deterministic text."
+        );
+    }
 
     #[test]
     fn coverage_ratio_ignores_intentional_exclusions() {

@@ -4,19 +4,24 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use repo2okf_core::{
     ArchitectureRelationshipKind, ClaimProvenance, CoverageDisposition, CoverageKind, Entity,
-    EntityKind, EvidenceRef, Language, Relationship, RelationshipKind, RelationshipOrigin,
-    RepositoryIr, SemanticResolution,
+    EntityKind, EvidenceRef, Language, OutputLocale, Relationship, RelationshipKind,
+    RelationshipOrigin, RepositoryIr, SemanticResolution,
 };
 
+use crate::locale::{
+    coverage_description, external_module_description, fallback_claim_description,
+    fallback_claim_title, python_description, root_package_title, source_title,
+};
 use crate::model::{
     ArchitectureScope, CoverageClassification, CoverageItem, EvidenceRecord, Generated,
     OkfArchitectureConcept, OkfClaim, OkfDocument, OkfRelationship, OkfSource,
     ProjectedSemanticRelationship, Repo2OkfMetadata, RepositorySnapshot, SemanticInventory,
 };
 
-impl From<&RepositoryIr> for RepositorySnapshot {
+impl RepositorySnapshot {
+    /// Project a repository IR into OKF documents using the requested prose locale.
     #[allow(clippy::too_many_lines)]
-    fn from(ir: &RepositoryIr) -> Self {
+    pub fn from_ir_with_locale(ir: &RepositoryIr, output_locale: OutputLocale) -> Self {
         let evidence = ir.evidence.iter().map(EvidenceRecord::from).collect();
         let coverage = ir
             .coverage
@@ -59,11 +64,11 @@ impl From<&RepositoryIr> for RepositorySnapshot {
 
             let document = documents
                 .entry(concept_id.clone())
-                .or_insert_with(|| document_for_coverage(ir, item, concept_id));
-            merge_coverage_metadata(document, ir, item);
+                .or_insert_with(|| document_for_coverage(ir, item, concept_id, output_locale));
+            merge_coverage_metadata(document, ir, item, output_locale);
             for evidence_id in &item.evidence_ids {
                 if let Some(record) = evidence_by_id.get(evidence_id.as_str()) {
-                    add_source(document, record);
+                    add_source(document, record, output_locale);
                 }
             }
         }
@@ -77,7 +82,7 @@ impl From<&RepositoryIr> for RepositorySnapshot {
             let path = normalized_source_path(&entity.path);
             python_concepts_by_path.insert(path, concept_id.clone());
             documents.entry(concept_id.clone()).or_insert_with(|| {
-                python_concept_document(ir, entity, &concept_id, &evidence_by_id)
+                python_concept_document(ir, entity, &concept_id, &evidence_by_id, output_locale)
             });
         }
 
@@ -107,11 +112,11 @@ impl From<&RepositoryIr> for RepositorySnapshot {
             };
             let concept_id = external_concept_id(&import.specifier);
             external_targets.insert(relationship.target.as_str(), concept_id.clone());
-            let document = documents
-                .entry(concept_id.clone())
-                .or_insert_with(|| external_document(ir, &concept_id, &import.specifier));
+            let document = documents.entry(concept_id.clone()).or_insert_with(|| {
+                external_document(ir, &concept_id, &import.specifier, output_locale)
+            });
             if let Some(record) = evidence_by_id.get(import.evidence_id.as_str()) {
-                add_source(document, record);
+                add_source(document, record, output_locale);
             }
         }
 
@@ -128,15 +133,15 @@ impl From<&RepositoryIr> for RepositorySnapshot {
                 .unwrap_or_else(|| fallback_claim_concept_id(&claim.id));
             let document = documents.entry(concept_id.clone()).or_insert_with(|| {
                 let mut document = OkfDocument::new(&concept_id, "Repository Claim");
-                document.metadata.title = Some(format!("Claim {}", claim.id));
+                document.metadata.title = Some(fallback_claim_title(output_locale, &claim.id));
                 document.metadata.description =
-                    Some("Evidence-bound repository knowledge claim.".to_owned());
+                    Some(fallback_claim_description(output_locale).to_owned());
                 document.metadata.generated = Some(generator(ir));
                 document
             });
             for evidence_id in &claim.evidence_ids {
                 if let Some(record) = evidence_by_id.get(evidence_id.as_str()) {
-                    add_source(document, record);
+                    add_source(document, record, output_locale);
                 }
             }
             let (agent_provider, agent_reported_model) = match &claim.provenance {
@@ -154,7 +159,7 @@ impl From<&RepositoryIr> for RepositorySnapshot {
             }
             document.claims.push(OkfClaim {
                 id: claim.id.clone(),
-                text: claim.text.clone(),
+                text: claim.text_for(output_locale).into_owned(),
                 evidence_ids: claim.evidence_ids.clone(),
                 ai_generated: agent_provider.is_some(),
                 agent_provider,
@@ -176,6 +181,7 @@ impl From<&RepositoryIr> for RepositorySnapshot {
             document.metadata.status = Some(crate::model::OkfStatus::Draft);
             document.metadata.generated = Some(generated_from_provenance(&concept.provenance));
             document.metadata.repo2okf = Some(Repo2OkfMetadata {
+                output_locale: Some(output_locale),
                 claims: Vec::new(),
                 relationships: Vec::new(),
                 architecture: Some(OkfArchitectureConcept {
@@ -188,7 +194,7 @@ impl From<&RepositoryIr> for RepositorySnapshot {
             });
             for evidence_id in &concept.evidence_ids {
                 if let Some(record) = evidence_by_id.get(evidence_id.as_str()) {
-                    add_source(&mut document, record);
+                    add_source(&mut document, record, output_locale);
                 }
             }
             documents.insert(concept_id, document);
@@ -286,11 +292,18 @@ impl From<&RepositoryIr> for RepositorySnapshot {
 
         Self {
             repository: ir.repository.name.clone(),
+            output_locale,
             documents: documents.into_values().collect(),
             evidence,
             coverage,
             semantic_inventory: Some(semantic_inventory(ir, projected_semantic_relationships)),
         }
+    }
+}
+
+impl From<&RepositoryIr> for RepositorySnapshot {
+    fn from(ir: &RepositoryIr) -> Self {
+        Self::from_ir_with_locale(ir, OutputLocale::En)
     }
 }
 
@@ -315,13 +328,11 @@ fn document_for_coverage(
     ir: &RepositoryIr,
     item: &repo2okf_core::CoverageItem,
     concept_id: &str,
+    output_locale: OutputLocale,
 ) -> OkfDocument {
     let mut document = OkfDocument::new(concept_id, coverage_type(item.kind));
     document.metadata.title = Some(item.subject.clone());
-    document.metadata.description = Some(format!(
-        "Repository knowledge extracted from {}.",
-        item.subject
-    ));
+    document.metadata.description = Some(coverage_description(output_locale, &item.subject));
     document.metadata.resource = item
         .evidence_ids
         .iter()
@@ -344,6 +355,7 @@ fn python_concept_document(
     entity: &Entity,
     concept_id: &str,
     evidence_by_id: &BTreeMap<&str, &EvidenceRef>,
+    output_locale: OutputLocale,
 ) -> OkfDocument {
     let package = is_python_package_path(&entity.path);
     let kind = if package {
@@ -352,16 +364,17 @@ fn python_concept_document(
         "Python Module"
     };
     let mut document = OkfDocument::new(concept_id, kind);
-    document.metadata.title = Some(python_concept_title(entity, package));
-    document.metadata.description = Some(format!(
-        "{kind} defined by {}.",
-        normalized_source_path(&entity.path)
+    document.metadata.title = Some(python_concept_title(entity, package, output_locale));
+    document.metadata.description = Some(python_description(
+        output_locale,
+        &normalized_source_path(&entity.path),
+        package,
     ));
     document.metadata.resource = Some(repository_resource(&entity.path, None));
     document.metadata.tags.push("python".to_owned());
     document.metadata.generated = Some(generator(ir));
     if let Some(record) = evidence_by_id.get(entity.evidence_id.as_str()) {
-        add_source(&mut document, record);
+        add_source(&mut document, record, output_locale);
     }
     document
 }
@@ -385,13 +398,13 @@ fn is_python_package_path(path: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("__init__.py"))
 }
 
-fn python_concept_title(entity: &Entity, package: bool) -> String {
+fn python_concept_title(entity: &Entity, package: bool, output_locale: OutputLocale) -> String {
     let logical = python_logical_name(entity);
     if logical != "__root__" {
         return logical;
     }
     if package {
-        "Repository root package".to_owned()
+        root_package_title(output_locale).to_owned()
     } else {
         normalized_source_path(&entity.path)
             .rsplit('/')
@@ -474,16 +487,14 @@ fn merge_coverage_metadata(
     document: &mut OkfDocument,
     ir: &RepositoryIr,
     item: &repo2okf_core::CoverageItem,
+    output_locale: OutputLocale,
 ) {
     // A file item describes the shared concept more accurately than the
     // declaration and import inventory items folded into the same file concept.
     if item.kind == CoverageKind::File {
         coverage_type(item.kind).clone_into(&mut document.metadata.concept_type);
         document.metadata.title = Some(item.subject.clone());
-        document.metadata.description = Some(format!(
-            "Repository knowledge extracted from {}.",
-            item.subject
-        ));
+        document.metadata.description = Some(coverage_description(output_locale, &item.subject));
         document.metadata.resource = Some(repository_resource(&item.subject, None));
         if let Some(language) = ir
             .files
@@ -496,10 +507,15 @@ fn merge_coverage_metadata(
     }
 }
 
-fn external_document(ir: &RepositoryIr, concept_id: &str, specifier: &str) -> OkfDocument {
+fn external_document(
+    ir: &RepositoryIr,
+    concept_id: &str,
+    specifier: &str,
+    output_locale: OutputLocale,
+) -> OkfDocument {
     let mut document = OkfDocument::new(concept_id, "External Module");
     document.metadata.title = Some(specifier.to_owned());
-    document.metadata.description = Some(format!("External module imported as {specifier}."));
+    document.metadata.description = Some(external_module_description(output_locale, specifier));
     document.metadata.resource = Some(format!("module:{specifier}"));
     document.metadata.generated = Some(generator(ir));
     document
@@ -520,7 +536,7 @@ fn coverage_type(kind: CoverageKind) -> &'static str {
     }
 }
 
-fn add_source(document: &mut OkfDocument, record: &EvidenceRef) {
+fn add_source(document: &mut OkfDocument, record: &EvidenceRef, output_locale: OutputLocale) {
     if document
         .metadata
         .sources
@@ -532,11 +548,11 @@ fn add_source(document: &mut OkfDocument, record: &EvidenceRef) {
     document.metadata.sources.push(OkfSource {
         id: None,
         resource: repository_resource(&record.path, Some(record.start_line)),
-        title: record
-            .symbol
-            .as_ref()
-            .map(|symbol| format!("{} in {}", symbol, record.path))
-            .or_else(|| Some(record.path.clone())),
+        title: Some(source_title(
+            output_locale,
+            record.symbol.as_deref(),
+            &record.path,
+        )),
         author: Some(format!("process:{}", record.extractor)),
         usage_count: None,
         last_modified: None,
@@ -760,11 +776,11 @@ fn architecture_scope(scope: &repo2okf_core::ArchitectureScope) -> ArchitectureS
 mod tests {
     use repo2okf_core::{
         ArchitectureConcept, ArchitectureRelationship, ArchitectureRelationshipKind,
-        ArchitectureScope as CoreArchitectureScope, ArchitectureStatus, Claim, ClaimProvenance,
-        CoverageDisposition, CoverageItem, CoverageKind, CoverageReport, Entity, EntityKind,
-        EvidenceRef, FileRecord, ImportRecord, Language, Relationship, RelationshipKind,
-        RelationshipOrigin, RepositoryIr, RepositoryMetadata, ScanStatus, SemanticCoverage,
-        SemanticReference, SemanticReferenceKind, SemanticResolution,
+        ArchitectureScope as CoreArchitectureScope, ArchitectureStatus, Claim, ClaimFact,
+        ClaimProvenance, CoverageDisposition, CoverageItem, CoverageKind, CoverageReport, Entity,
+        EntityKind, EvidenceRef, FileRecord, ImportRecord, Language, OutputLocale, Relationship,
+        RelationshipKind, RelationshipOrigin, RepositoryIr, RepositoryMetadata, ScanStatus,
+        SemanticCoverage, SemanticReference, SemanticReferenceKind, SemanticResolution,
     };
 
     use super::{
@@ -832,6 +848,7 @@ mod tests {
             claims: vec![Claim {
                 id: "claim-1".into(),
                 text: "main is declared.".into(),
+                fact: None,
                 evidence_ids: vec!["ev-1".into()],
                 provenance,
                 confidence: Some(90),
@@ -896,6 +913,70 @@ mod tests {
     }
 
     #[test]
+    fn localizes_generated_prose_without_changing_machine_contracts() {
+        let mut repository = ir(ClaimProvenance::Deterministic {
+            process: "repo2okf-core/0.1.0".into(),
+        });
+        repository.claims[0].fact = Some(ClaimFact::Declaration {
+            path: "src/main.ts".into(),
+            entity_kind: EntityKind::Function,
+            name: "main".into(),
+        });
+
+        let english = RepositorySnapshot::from_ir_with_locale(&repository, OutputLocale::En);
+        let japanese = RepositorySnapshot::from_ir_with_locale(&repository, OutputLocale::Ja);
+        let english_document = &english.documents[0];
+        let japanese_document = &japanese.documents[0];
+
+        assert_eq!(english.output_locale, OutputLocale::En);
+        assert_eq!(japanese.output_locale, OutputLocale::Ja);
+        assert_eq!(english.evidence, japanese.evidence);
+        assert_eq!(english.coverage, japanese.coverage);
+        assert_eq!(english.semantic_inventory, japanese.semantic_inventory);
+        assert_eq!(english_document.id, japanese_document.id);
+        assert_eq!(
+            english_document.metadata.concept_type,
+            japanese_document.metadata.concept_type
+        );
+        assert_eq!(
+            english_document.metadata.resource,
+            japanese_document.metadata.resource
+        );
+        assert_eq!(
+            english_document.claims[0].id,
+            japanese_document.claims[0].id
+        );
+        assert_eq!(
+            english_document.claims[0].evidence_ids,
+            japanese_document.claims[0].evidence_ids
+        );
+        assert_eq!(
+            english_document.metadata.description.as_deref(),
+            Some("Repository knowledge extracted from src/main.ts.")
+        );
+        assert_eq!(
+            japanese_document.metadata.description.as_deref(),
+            Some("src/main.ts から抽出したリポジトリの情報です。")
+        );
+        assert_eq!(
+            english_document.claims[0].text,
+            "src/main.ts declares function `main`."
+        );
+        assert_eq!(
+            japanese_document.claims[0].text,
+            "src/main.ts では、関数 `main` が宣言されています。"
+        );
+        assert_eq!(
+            english_document.metadata.sources[0].title.as_deref(),
+            Some("main in src/main.ts")
+        );
+        assert_eq!(
+            japanese_document.metadata.sources[0].title.as_deref(),
+            Some("src/main.ts 内の main")
+        );
+    }
+
+    #[test]
     fn python_concept_ids_are_portable_bounded_and_collision_safe() {
         let entity = |path: &str, qualified_name: &str| Entity {
             id: format!("entity:{path}"),
@@ -956,6 +1037,7 @@ mod tests {
             &root_package,
             &python_concept_id(&root_package),
             &evidence,
+            repo2okf_core::OutputLocale::En,
         );
         assert_eq!(
             root_document.metadata.title.as_deref(),

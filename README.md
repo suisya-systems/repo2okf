@@ -34,6 +34,10 @@ Generated OKF is written to `.okf`; scanner state is stored in `.repo2okf`.
 Both directories are generated and should be added to `.gitignore`, not
 committed.
 
+Set `output.locale` to `"ja"` in `repo2okf.toml` to render the human-readable
+OKF prose in Japanese. Machine-readable schema fields, IDs, paths, symbols,
+types, statuses, relationship kinds, and the CLI remain English/canonical.
+
 ## Verification model
 
 Repo2OKF treats AI output as an untrusted claim, not as source truth.

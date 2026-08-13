@@ -9,6 +9,7 @@ languages = ["typescript", "javascript", "python", "go", "rust", "markdown"]
 directory = ".okf"
 ir_file = ".repo2okf/ir.json"
 state_file = ".repo2okf/state.json"
+locale = "en"
 
 [agent]
 max_repair_attempts = 2

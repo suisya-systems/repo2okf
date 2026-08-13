@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
+use repo2okf_core::OutputLocale;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_yaml::Value;
 use thiserror::Error;
@@ -132,6 +133,9 @@ impl OkfMetadata {
 /// verifiable without changing OKF's standard fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repo2OkfMetadata {
+    /// Locale used for human-readable text in this generated document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_locale: Option<OutputLocale>,
     /// Structured semantic claims rendered into the Markdown body.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<OkfClaim>,
@@ -375,6 +379,9 @@ pub struct EvidenceRecord {
 pub struct RepositorySnapshot {
     /// Repository title used in the root index.
     pub repository: String,
+    /// Locale used to render human-readable output without changing analysis.
+    #[serde(default)]
+    pub output_locale: OutputLocale,
     /// Documents planned by the scanner/coverage planner.
     #[serde(default)]
     pub documents: Vec<OkfDocument>,
@@ -468,6 +475,10 @@ pub trait RepositoryIrView {
     fn evidence_records(&self) -> &[EvidenceRecord];
     /// Coverage classifications.
     fn coverage_items(&self) -> &[CoverageItem];
+    /// Locale used to render human-readable output.
+    fn output_locale(&self) -> OutputLocale {
+        OutputLocale::En
+    }
     /// Optional semantic graph inventory for validating projected IDs.
     fn semantic_inventory(&self) -> Option<&SemanticInventory> {
         None
@@ -489,6 +500,10 @@ impl RepositoryIrView for RepositorySnapshot {
 
     fn coverage_items(&self) -> &[CoverageItem] {
         &self.coverage
+    }
+
+    fn output_locale(&self) -> OutputLocale {
+        self.output_locale
     }
 
     fn semantic_inventory(&self) -> Option<&SemanticInventory> {

@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::locale::{
+    claims_heading, coverage_heading, evidence_title, excluded_label, included_label,
+    relationships_heading, repository_knowledge_title, unresolved_label,
+};
 use crate::model::{
     CoverageClassification, DocumentPathError, EvidenceRecord, OKF_VERSION, OkfDocument, OkfSource,
     ProjectedSemanticRelationship, Repo2OkfMetadata, RepositoryIrView, SemanticInventory,
@@ -233,10 +237,16 @@ where
     P: AsRef<Path>,
 {
     let output_dir = output_dir.as_ref();
+    let output_locale = ir.output_locale();
     let evidence = evidence_map(ir.evidence_records())?;
     let mut documents = ir.okf_documents().to_vec();
 
-    validate_and_normalize_documents(&mut documents, &evidence, ir.semantic_inventory())?;
+    validate_and_normalize_documents(
+        &mut documents,
+        &evidence,
+        ir.semantic_inventory(),
+        output_locale,
+    )?;
     documents.sort_by_key(|document| portable_id(&document.id));
     validate_relationships(&documents)?;
     validate_coverage(ir.coverage_items(), &documents)?;
@@ -247,7 +257,12 @@ where
     })?;
 
     let mut files_written = Vec::with_capacity(documents.len() + 1);
-    let index = render_index(ir.repository_name(), &documents, ir.coverage_items())?;
+    let index = render_index(
+        ir.repository_name(),
+        &documents,
+        ir.coverage_items(),
+        output_locale,
+    )?;
     write_file(output_dir, Path::new("index.md"), &index)?;
     files_written.push(PathBuf::from("index.md"));
 
@@ -258,7 +273,7 @@ where
                 id: document.id.clone(),
                 source,
             })?;
-        let content = render_document(document)?;
+        let content = render_document(document, output_locale)?;
         write_file(output_dir, &relative, &content)?;
         files_written.push(relative);
     }
@@ -278,6 +293,7 @@ fn validate_and_normalize_documents(
     documents: &mut [OkfDocument],
     evidence: &BTreeMap<&str, &EvidenceRecord>,
     semantic_inventory: Option<&SemanticInventory>,
+    output_locale: repo2okf_core::OutputLocale,
 ) -> Result<(), EmitError> {
     let mut document_ids = BTreeSet::new();
     let mut claim_ids = BTreeSet::new();
@@ -293,7 +309,13 @@ fn validate_and_normalize_documents(
             return Err(EmitError::EmptyConceptType(document.id.clone()));
         }
 
-        normalize_document(document, evidence, semantic_inventory, &mut claim_ids)?;
+        normalize_document(
+            document,
+            evidence,
+            semantic_inventory,
+            &mut claim_ids,
+            output_locale,
+        )?;
     }
     validate_projection_contract(documents, semantic_inventory)?;
     Ok(())
@@ -350,6 +372,7 @@ fn normalize_document(
     evidence: &BTreeMap<&str, &EvidenceRecord>,
     semantic_inventory: Option<&SemanticInventory>,
     claim_ids: &mut BTreeSet<String>,
+    output_locale: repo2okf_core::OutputLocale,
 ) -> Result<(), EmitError> {
     validate_metadata(document)?;
     document.metadata.tags.sort();
@@ -616,13 +639,13 @@ fn normalize_document(
     }
 
     for record in &claim_evidence {
-        ensure_evidence_source(document, record);
+        ensure_evidence_source(document, record, output_locale);
     }
     for record in &relationship_evidence {
-        ensure_evidence_source(document, record);
+        ensure_evidence_source(document, record, output_locale);
     }
     for record in &architecture_evidence {
-        ensure_evidence_source(document, record);
+        ensure_evidence_source(document, record, output_locale);
     }
 
     if (document.claims.iter().any(|claim| claim.ai_generated)
@@ -669,18 +692,12 @@ fn normalize_document(
         .repo2okf
         .as_ref()
         .and_then(|extension| extension.architecture.clone());
-    document.metadata.repo2okf = if document.claims.is_empty()
-        && document.relationships.is_empty()
-        && architecture.is_none()
-    {
-        None
-    } else {
-        Some(Repo2OkfMetadata {
-            claims: document.claims.clone(),
-            relationships: document.relationships.clone(),
-            architecture,
-        })
-    };
+    document.metadata.repo2okf = Some(Repo2OkfMetadata {
+        output_locale: Some(output_locale),
+        claims: document.claims.clone(),
+        relationships: document.relationships.clone(),
+        architecture,
+    });
     Ok(())
 }
 
@@ -799,7 +816,11 @@ fn validate_relationships(documents: &[OkfDocument]) -> Result<(), EmitError> {
     Ok(())
 }
 
-fn ensure_evidence_source(document: &mut OkfDocument, record: &EvidenceRecord) {
+fn ensure_evidence_source(
+    document: &mut OkfDocument,
+    record: &EvidenceRecord,
+    output_locale: repo2okf_core::OutputLocale,
+) {
     if let Some(source) = document
         .metadata
         .sources
@@ -814,7 +835,7 @@ fn ensure_evidence_source(document: &mut OkfDocument, record: &EvidenceRecord) {
     document.metadata.sources.push(OkfSource {
         id: Some(footnote_id(&record.id)),
         resource: evidence_resource(record),
-        title: Some(format!("Source evidence {}", record.id)),
+        title: Some(evidence_title(output_locale, &record.id)),
         author: Some("process:repo2okf-scanner".to_owned()),
         usage_count: None,
         last_modified: None,
@@ -931,7 +952,10 @@ fn validate_coverage(
     Ok(())
 }
 
-fn render_document(document: &OkfDocument) -> Result<String, EmitError> {
+fn render_document(
+    document: &OkfDocument,
+    output_locale: repo2okf_core::OutputLocale,
+) -> Result<String, EmitError> {
     let mut rendered = render_frontmatter(&document.metadata)?;
     let body = document.body.trim();
     let source_ids = document
@@ -948,7 +972,12 @@ fn render_document(document: &OkfDocument) -> Result<String, EmitError> {
     }
 
     if !document.relationships.is_empty() {
-        rendered.push_str("\n## Relationships\n\n");
+        write!(
+            rendered,
+            "\n## {}\n\n",
+            relationships_heading(output_locale)
+        )
+        .expect("writing to a String cannot fail");
         for relationship in &document.relationships {
             let label = relationship
                 .label
@@ -980,7 +1009,8 @@ fn render_document(document: &OkfDocument) -> Result<String, EmitError> {
     }
 
     if !document.claims.is_empty() {
-        rendered.push_str("\n## Evidence-bound claims\n\n");
+        write!(rendered, "\n## {}\n\n", claims_heading(output_locale))
+            .expect("writing to a String cannot fail");
         for claim in &document.claims {
             rendered.push_str("- ");
             rendered.push_str(&escape_markdown_text(claim.text.trim()));
@@ -1023,16 +1053,24 @@ fn render_index(
     repository_name: &str,
     documents: &[OkfDocument],
     coverage: &[crate::model::CoverageItem],
+    output_locale: repo2okf_core::OutputLocale,
 ) -> Result<String, EmitError> {
+    #[derive(Serialize)]
+    struct IndexRepo2Okf {
+        output_locale: repo2okf_core::OutputLocale,
+    }
+
     #[derive(Serialize)]
     struct IndexFrontmatter {
         okf_version: &'static str,
+        repo2okf: IndexRepo2Okf,
     }
     let mut rendered = render_frontmatter(&IndexFrontmatter {
         okf_version: OKF_VERSION,
+        repo2okf: IndexRepo2Okf { output_locale },
     })?;
     let title = if repository_name.trim().is_empty() {
-        "Repository knowledge"
+        repository_knowledge_title(output_locale)
     } else {
         repository_name
     };
@@ -1055,10 +1093,14 @@ fn render_index(
         .expect("writing to a String cannot fail");
     }
     let (included, excluded, unresolved) = coverage_counts(coverage);
-    rendered.push_str("\n## Coverage\n\n");
+    write!(rendered, "\n## {}\n\n", coverage_heading(output_locale))
+        .expect("writing to a String cannot fail");
     write!(
         rendered,
-        "- Included: {included}\n- Excluded: {excluded}\n- Unresolved: {unresolved}\n"
+        "- {}: {included}\n- {}: {excluded}\n- {}: {unresolved}\n",
+        included_label(output_locale),
+        excluded_label(output_locale),
+        unresolved_label(output_locale),
     )
     .expect("writing to a String cannot fail");
     Ok(rendered)

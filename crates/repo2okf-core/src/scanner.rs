@@ -16,11 +16,11 @@ use tree_sitter::{Node, Parser};
 
 use crate::python_resolver::resolve_python_imports;
 use crate::{
-    Claim, ClaimProvenance, CoverageDisposition, CoverageItem, CoverageKind, CoverageReport,
-    EXTRACTOR_VERSION, Entity, EntityKind, EvidenceRef, FileRecord, IR_SCHEMA_VERSION,
-    ImportRecord, Language, Relationship, RelationshipKind, RelationshipOrigin, RepositoryIr,
-    RepositoryMetadata, ScanStatus, SemanticCoverage, SemanticReference, SemanticReferenceKind,
-    SemanticResolution,
+    Claim, ClaimFact, ClaimProvenance, CoverageDisposition, CoverageItem, CoverageKind,
+    CoverageReport, EXTRACTOR_VERSION, Entity, EntityKind, EvidenceRef, FileRecord,
+    IR_SCHEMA_VERSION, ImportRecord, Language, Relationship, RelationshipKind, RelationshipOrigin,
+    RepositoryIr, RepositoryMetadata, ScanStatus, SemanticCoverage, SemanticReference,
+    SemanticReferenceKind, SemanticResolution,
 };
 
 /// Repository scan configuration.
@@ -2017,6 +2017,11 @@ fn parsed_extraction(
                 entity_kind_label(symbol.kind),
                 symbol.name
             ),
+            fact: Some(ClaimFact::Declaration {
+                path: path.clone(),
+                entity_kind: symbol.kind,
+                name: symbol.name.clone(),
+            }),
             evidence_ids: vec![symbol_evidence.id.clone()],
             provenance: ClaimProvenance::Deterministic {
                 process: EXTRACTOR_VERSION.into(),
@@ -2050,6 +2055,11 @@ fn parsed_extraction(
                     entity_kind_label(symbol.kind),
                     symbol.name
                 ),
+                fact: Some(ClaimFact::PythonSymbolDocstring {
+                    path: path.clone(),
+                    entity_kind: symbol.kind,
+                    name: symbol.name.clone(),
+                }),
                 evidence_ids: vec![symbol_evidence.id.clone(), docstring_evidence.id.clone()],
                 provenance: ClaimProvenance::Deterministic {
                     process: EXTRACTOR_VERSION.into(),
@@ -2090,6 +2100,7 @@ fn parsed_extraction(
                 ],
             ),
             text: format!("{path} has a Python module docstring."),
+            fact: Some(ClaimFact::PythonModuleDocstring { path: path.clone() }),
             evidence_ids: vec![file_evidence.id.clone(), docstring_evidence.id.clone()],
             provenance: ClaimProvenance::Deterministic {
                 process: EXTRACTOR_VERSION.into(),

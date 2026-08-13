@@ -1,5 +1,7 @@
 ---
 okf_version: '0.2'
+repo2okf:
+  output_locale: en
 ---
 
 # demo
