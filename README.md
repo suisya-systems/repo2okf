@@ -27,6 +27,9 @@ repo2okf verify --strict
 repo2okf coverage
 ```
 
+See the [CLI reference](docs/cli-reference.md) for every command, option, and
+agent flag combination.
+
 Generated OKF is written to `.okf`; scanner state is stored in `.repo2okf`.
 Both directories are generated and should be added to `.gitignore`, not
 committed.
