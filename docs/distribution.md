@@ -21,16 +21,16 @@ archives. GitHub artifact attestations are enabled in `dist-workspace.toml`.
 
 ## Install the pre-release
 
-The current dogfood release is `v0.1.0-alpha.1`. Install it without a Rust
+The current dogfood release is `v0.1.0-alpha.2`. Install it without a Rust
 toolchain:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.1/repo2okf-installer.sh | sh
+  https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.2/repo2okf-installer.sh | sh
 ```
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.1/repo2okf-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.2/repo2okf-installer.ps1 | iex"
 ```
 
 The release page also provides archives, SHA-256 checksums, and GitHub artifact
