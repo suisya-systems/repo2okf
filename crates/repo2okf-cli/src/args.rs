@@ -89,7 +89,7 @@ pub struct CompileArgs {
     #[arg(long, conflicts_with = "agent")]
     pub facts_only: bool,
 
-    /// Optionally review generated claims with the other agent.
+    /// Optionally replace generated claims and architecture drafts with another agent's review.
     #[arg(
         long,
         value_enum,

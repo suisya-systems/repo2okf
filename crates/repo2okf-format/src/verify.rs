@@ -9,7 +9,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    CoverageClassification, CoverageItem, EvidenceRecord, OKF_VERSION, OkfMetadata, concept_path,
+    CoverageClassification, CoverageItem, EvidenceRecord, OKF_VERSION, OkfArchitectureConcept,
+    OkfMetadata, OkfRelationship, ProjectedSemanticRelationship, SemanticInventory, concept_path,
 };
 
 /// A freshness invariant that differs from the persisted compiler snapshot.
@@ -41,6 +42,10 @@ pub struct VerifyOptions {
     pub expected_concepts: Option<BTreeSet<String>>,
     /// Freshness mismatches detected by the host before structural validation.
     pub freshness_mismatches: BTreeSet<FreshnessMismatch>,
+    /// Repository graph IDs against which generated semantic metadata is checked.
+    ///
+    /// Absence preserves baseline validation for hand-authored OKF bundles.
+    pub semantic_inventory: Option<SemanticInventory>,
 }
 
 impl Default for VerifyOptions {
@@ -52,6 +57,7 @@ impl Default for VerifyOptions {
             today: Utc::now().date_naive(),
             expected_concepts: None,
             freshness_mismatches: BTreeSet::new(),
+            semantic_inventory: None,
         }
     }
 }
@@ -635,6 +641,7 @@ fn validate_concepts(
     let footnote =
         Regex::new(r"\[\^(?P<id>[^\]]+)\]").expect("static Markdown footnote regex must compile");
     let mut bundle_claim_ids = BTreeSet::new();
+    let mut actual_projected_relationships = BTreeSet::new();
 
     for concept in concepts {
         let document = Some(path_string(&concept.relative_path));
@@ -726,6 +733,88 @@ fn validate_concepts(
                         .unwrap_or(&relationship.target)
                 );
                 validate_link(&concept.relative_path, &target, existing, options, issues);
+                let derived = !relationship.source_relationship_ids.is_empty()
+                    || !relationship.origin_reference_ids.is_empty()
+                    || !relationship.evidence_ids.is_empty();
+                if derived && relationship.evidence_ids.is_empty() {
+                    error(
+                        issues,
+                        "relationship-without-evidence",
+                        document.clone(),
+                        format!(
+                            "repository-derived relationship to `{}` has no evidence IDs",
+                            relationship.target
+                        ),
+                    );
+                }
+                let semantic = relationship
+                    .kind
+                    .as_deref()
+                    .is_some_and(is_semantic_relationship_kind);
+                if semantic && (options.semantic_inventory.is_some() || derived) {
+                    if relationship.source_relationship_ids.is_empty() {
+                        error(
+                            issues,
+                            "semantic-relationship-without-graph-edge",
+                            document.clone(),
+                            format!(
+                                "semantic relationship `{}` to `{}` has no graph relationship ID",
+                                relationship.kind.as_deref().unwrap_or_default(),
+                                relationship.target
+                            ),
+                        );
+                    }
+                    if relationship.origin_reference_ids.is_empty() {
+                        error(
+                            issues,
+                            "semantic-relationship-without-origin",
+                            document.clone(),
+                            format!(
+                                "semantic relationship `{}` to `{}` has no origin reference",
+                                relationship.kind.as_deref().unwrap_or_default(),
+                                relationship.target
+                            ),
+                        );
+                    }
+                }
+                if options
+                    .semantic_inventory
+                    .as_ref()
+                    .is_some_and(|inventory| inventory.projection_contract_complete)
+                    && is_projection_contract_relationship(relationship)
+                    && !actual_projected_relationships.insert(
+                        ProjectedSemanticRelationship::from_okf(&concept.id, relationship),
+                    )
+                {
+                    error(
+                        issues,
+                        "duplicate-semantic-projection",
+                        document.clone(),
+                        format!(
+                            "semantic relationship `{}` to `{}` is projected more than once",
+                            relationship.kind.as_deref().unwrap_or_default(),
+                            relationship.target
+                        ),
+                    );
+                }
+                validate_relationship_ids(
+                    concept,
+                    relationship,
+                    evidence,
+                    &source_by_evidence,
+                    options.semantic_inventory.as_ref(),
+                    issues,
+                );
+            }
+            if let Some(architecture) = &extension.architecture {
+                validate_architecture_metadata(
+                    concept,
+                    architecture,
+                    evidence,
+                    &source_by_evidence,
+                    options.semantic_inventory.as_ref(),
+                    issues,
+                );
             }
             for claim in &extension.claims {
                 let bundle_claim_id = format!("{}:{}", concept.id, claim.id);
@@ -818,6 +907,40 @@ fn validate_concepts(
                 },
                 document,
                 format!("concept is stale as of {stale_after}"),
+            );
+        }
+    }
+
+    if let Some(inventory) = options
+        .semantic_inventory
+        .as_ref()
+        .filter(|inventory| inventory.projection_contract_complete)
+    {
+        let expected = inventory
+            .projected_relationships
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for missing in expected.difference(&actual_projected_relationships) {
+            error(
+                issues,
+                "missing-semantic-projection",
+                None,
+                format!(
+                    "bundle omits canonical relationship {} --{}--> {}",
+                    missing.source_concept_id, missing.kind, missing.target_concept_id
+                ),
+            );
+        }
+        for unexpected in actual_projected_relationships.difference(&expected) {
+            error(
+                issues,
+                "unexpected-semantic-projection",
+                None,
+                format!(
+                    "bundle contains non-canonical relationship {} --{}--> {}",
+                    unexpected.source_concept_id, unexpected.kind, unexpected.target_concept_id
+                ),
             );
         }
     }
@@ -932,6 +1055,266 @@ fn validate_sources<'a>(
         }
     }
     evidence_ids
+}
+
+fn validate_relationship_ids(
+    concept: &ParsedConcept,
+    relationship: &OkfRelationship,
+    evidence: &BTreeMap<&str, &EvidenceRecord>,
+    source_by_evidence: &BTreeSet<&str>,
+    semantic_inventory: Option<&SemanticInventory>,
+    issues: &mut Vec<VerificationIssue>,
+) {
+    let document = Some(path_string(&concept.relative_path));
+    for (field, ids) in [
+        (
+            "source_relationship_ids",
+            relationship.source_relationship_ids.as_slice(),
+        ),
+        (
+            "origin_reference_ids",
+            relationship.origin_reference_ids.as_slice(),
+        ),
+        ("evidence_ids", relationship.evidence_ids.as_slice()),
+    ] {
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            if id.trim().is_empty() {
+                error(
+                    issues,
+                    "invalid-relationship-provenance",
+                    document.clone(),
+                    format!(
+                        "relationship to `{}` contains an empty {field} entry",
+                        relationship.target
+                    ),
+                );
+            } else if !seen.insert(id) {
+                error(
+                    issues,
+                    "duplicate-relationship-provenance",
+                    document.clone(),
+                    format!(
+                        "relationship to `{}` repeats `{id}` in {field}",
+                        relationship.target
+                    ),
+                );
+            }
+        }
+    }
+
+    for id in &relationship.evidence_ids {
+        if !evidence.contains_key(id.as_str()) {
+            error(
+                issues,
+                "unresolved-evidence-id",
+                document.clone(),
+                format!(
+                    "relationship to `{}` references unknown evidence `{id}`",
+                    relationship.target
+                ),
+            );
+        } else if !source_by_evidence.contains(id.as_str()) {
+            error(
+                issues,
+                "relationship-evidence-not-sourced",
+                document.clone(),
+                format!(
+                    "relationship to `{}` evidence `{id}` has no matching sources[].evidence_id",
+                    relationship.target
+                ),
+            );
+        }
+    }
+
+    if let Some(inventory) = semantic_inventory {
+        for id in &relationship.source_relationship_ids {
+            if !inventory.relationship_ids.iter().any(|known| known == id) {
+                error(
+                    issues,
+                    "unknown-graph-relationship",
+                    document.clone(),
+                    format!(
+                        "relationship to '{}' cites unknown graph edge '{id}'",
+                        relationship.target
+                    ),
+                );
+            }
+        }
+        for id in &relationship.origin_reference_ids {
+            if !inventory
+                .resolved_reference_ids
+                .iter()
+                .any(|known| known == id)
+            {
+                error(
+                    issues,
+                    "non-resolved-relationship-origin",
+                    document.clone(),
+                    format!(
+                        "relationship to '{}' cites missing or non-resolved reference '{id}'",
+                        relationship.target
+                    ),
+                );
+            }
+        }
+        validate_semantic_projection_tuple(concept, relationship, inventory, document, issues);
+    }
+}
+
+fn validate_semantic_projection_tuple(
+    concept: &ParsedConcept,
+    relationship: &OkfRelationship,
+    inventory: &SemanticInventory,
+    document: Option<String>,
+    issues: &mut Vec<VerificationIssue>,
+) {
+    if !inventory.projection_contract_complete || !is_projection_contract_relationship(relationship)
+    {
+        return;
+    }
+    let projected = ProjectedSemanticRelationship::from_okf(&concept.id, relationship);
+    if !inventory.projected_relationships.contains(&projected) {
+        error(
+            issues,
+            "semantic-projection-mismatch",
+            document,
+            format!(
+                "semantic relationship to '{}' does not match its canonical repository projection",
+                relationship.target
+            ),
+        );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_architecture_metadata(
+    concept: &ParsedConcept,
+    architecture: &OkfArchitectureConcept,
+    evidence: &BTreeMap<&str, &EvidenceRecord>,
+    source_by_evidence: &BTreeSet<&str>,
+    semantic_inventory: Option<&SemanticInventory>,
+    issues: &mut Vec<VerificationIssue>,
+) {
+    let document = Some(path_string(&concept.relative_path));
+    if concept.metadata.status != Some(crate::model::OkfStatus::Draft) {
+        error(
+            issues,
+            "architecture-not-draft",
+            document.clone(),
+            "agent-proposed architecture concepts must remain draft".to_owned(),
+        );
+    }
+    if !concept
+        .metadata
+        .generated
+        .as_ref()
+        .is_some_and(|event| is_agent_actor(&event.by))
+    {
+        error(
+            issues,
+            "architecture-without-agent-provenance",
+            document.clone(),
+            "architecture concept must identify the proposing agent".to_owned(),
+        );
+    }
+    if architecture.source_concept_id.trim().is_empty()
+        || architecture.member_entity_ids.len() < 2
+        || architecture.supporting_relationship_ids.is_empty()
+        || architecture.evidence_ids.is_empty()
+    {
+        error(
+            issues,
+            "invalid-architecture-support",
+            document.clone(),
+            "architecture concept lacks graph members, support, or evidence".to_owned(),
+        );
+    }
+    for (field, ids) in [
+        (
+            "member_entity_ids",
+            architecture.member_entity_ids.as_slice(),
+        ),
+        (
+            "supporting_relationship_ids",
+            architecture.supporting_relationship_ids.as_slice(),
+        ),
+        ("evidence_ids", architecture.evidence_ids.as_slice()),
+    ] {
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            if id.trim().is_empty() || !seen.insert(id) {
+                error(
+                    issues,
+                    "invalid-architecture-support",
+                    document.clone(),
+                    format!("{field} contains an empty or duplicate ID"),
+                );
+            }
+        }
+    }
+    for id in &architecture.evidence_ids {
+        if !evidence.contains_key(id.as_str()) {
+            error(
+                issues,
+                "unresolved-evidence-id",
+                document.clone(),
+                format!("architecture concept references unknown evidence '{id}'"),
+            );
+        } else if !source_by_evidence.contains(id.as_str()) {
+            error(
+                issues,
+                "architecture-evidence-not-sourced",
+                document.clone(),
+                format!("architecture evidence '{id}' has no matching sources[].evidence_id"),
+            );
+        }
+    }
+    if let Some(inventory) = semantic_inventory {
+        if !inventory
+            .architecture_concept_ids
+            .iter()
+            .any(|known| known == &architecture.source_concept_id)
+        {
+            error(
+                issues,
+                "unknown-architecture-concept",
+                document.clone(),
+                format!(
+                    "architecture source concept '{}' is absent from the repository IR",
+                    architecture.source_concept_id
+                ),
+            );
+        }
+        for id in &architecture.member_entity_ids {
+            if !inventory.entity_ids.iter().any(|known| known == id) {
+                error(
+                    issues,
+                    "unknown-architecture-member",
+                    document.clone(),
+                    format!("architecture member '{id}' is absent from the repository IR"),
+                );
+            }
+        }
+        for id in &architecture.supporting_relationship_ids {
+            if !inventory.relationship_ids.iter().any(|known| known == id) {
+                error(
+                    issues,
+                    "unknown-graph-relationship",
+                    document.clone(),
+                    format!("architecture support edge '{id}' is absent from the repository IR"),
+                );
+            }
+        }
+        if architecture.scope != inventory.architecture_scope {
+            error(
+                issues,
+                "architecture-scope-mismatch",
+                document,
+                "architecture scope differs from the repository IR".to_owned(),
+            );
+        }
+    }
 }
 
 fn validate_computation_paths(concept: &ParsedConcept, issues: &mut Vec<VerificationIssue>) {
@@ -1325,6 +1708,16 @@ fn value_as_string(value: &serde_yaml::Value) -> Option<String> {
         serde_yaml::Value::Number(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn is_semantic_relationship_kind(kind: &str) -> bool {
+    matches!(kind, "calls" | "extends" | "type_uses" | "decorated_by")
+}
+
+fn is_projection_contract_relationship(relationship: &OkfRelationship) -> bool {
+    !relationship.origin_reference_ids.is_empty()
+        || (relationship.kind.as_deref() == Some("depends_on")
+            && !relationship.source_relationship_ids.is_empty())
 }
 
 fn is_external_target(target: &str) -> bool {

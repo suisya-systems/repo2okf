@@ -192,10 +192,13 @@ fn normalize_relative_python_module(
     let filename = path_components
         .pop()
         .ok_or(PythonImportFailure::EscapesRepository)?;
-    if path_components.first().copied() == Some("src") {
+    if path_components
+        .first()
+        .is_some_and(|component| component.eq_ignore_ascii_case("src"))
+    {
         path_components.remove(0);
     }
-    if path_components.is_empty() && filename != "__init__.py" {
+    if path_components.is_empty() && !filename.eq_ignore_ascii_case("__init__.py") {
         return Err(PythonImportFailure::EscapesRepository);
     }
 
@@ -217,7 +220,7 @@ fn python_module_for_path(path: &str) -> Option<String> {
         return None;
     }
     let stem = &filename[..filename.len() - 3];
-    if stem != "__init__" {
+    if !stem.eq_ignore_ascii_case("__init__") {
         components.push(stem);
     }
     if components
@@ -237,10 +240,12 @@ fn python_modules_for_path(path: &str) -> BTreeSet<String> {
     // `src/` is Python's conventional import root. Indexing both spellings is
     // deterministic, and the resolver still requires exactly one target, so a
     // real top-level collision becomes unresolved rather than guessed.
-    if let Some(stripped) = canonical.strip_prefix("src.")
-        && !stripped.is_empty()
+    if canonical
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("src."))
+        && canonical.len() > 4
     {
-        modules.insert(stripped.to_owned());
+        modules.insert(canonical[4..].to_owned());
     }
     modules
 }
@@ -290,6 +295,7 @@ const fn python_import_failure_reason(failure: PythonImportFailure) -> &'static 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RelationshipOrigin;
 
     fn parsed_python_file(path: &str, evidence_id: &str) -> FileRecord {
         FileRecord {
@@ -307,6 +313,8 @@ mod tests {
             id: id.to_owned(),
             kind: EntityKind::File,
             name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            qualified_name: path.to_owned(),
+            owner_id: None,
             path: path.to_owned(),
             language: Some(Language::Python),
             evidence_id: evidence_id.to_owned(),
@@ -437,6 +445,7 @@ mod tests {
                 source: "file-service".to_owned(),
                 target: external_module_id(&import.specifier),
                 kind: RelationshipKind::Imports,
+                origin: RelationshipOrigin::ObservedSyntax,
                 evidence_ids: vec!["ev-import".to_owned()],
             })
             .collect::<Vec<_>>();
@@ -506,6 +515,7 @@ mod tests {
                 source: "file-service".to_owned(),
                 target: external_module_id(&import.specifier),
                 kind: RelationshipKind::Imports,
+                origin: RelationshipOrigin::ObservedSyntax,
                 evidence_ids: vec![import.evidence_id.clone()],
             })
             .collect::<Vec<_>>();

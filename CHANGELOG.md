@@ -23,6 +23,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Compiler-owned bundle/IR/state integrity checks and staged publication.
 - Root/file identity revalidation and rollback-safe bundle/cache publication.
 - OKF v0.2 emission and verification.
+- Evidence-backed Python semantic references for import bindings, direct calls,
+  class bases, annotation type uses and decorators, with explicit conservative
+  resolution and semantic coverage.
+- Deterministic Python module/package OKF concepts that aggregate semantic
+  relationships without generating a document per symbol or reference.
+- Evidence-preserving semantic relationships and always-draft, host-validated
+  architecture concept proposals from optional agents.
 
 ### Changed
 

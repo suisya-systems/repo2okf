@@ -39,10 +39,11 @@ committed.
 Repo2OKF treats AI output as an untrusted claim, not as source truth.
 
 - The scanner produces a deterministic repository inventory, evidence records,
-  and coverage accounting.
+  source/semantic graphs, and coverage accounting.
 - Evidence binds claims to a path, source range, symbol, and content hash.
-- Optional agents return structured claim candidates. They do not write the
-  repository or generated OKF.
+- Optional agents return structured claim and architecture candidates. The host
+  validates their graph/evidence references and emits architecture as `draft`;
+  agents do not write the repository or generated OKF.
 - `verify` rescans the repository and compares the bundle with a fresh
   deterministic emission, detecting source drift and manual edits.
 
@@ -76,10 +77,13 @@ version requirements.
 
 The scanner currently parses Rust, Go, JavaScript, TypeScript, Python, and
 Markdown. Local import resolution is implemented for relative JavaScript and
-TypeScript imports and for unambiguous Python modules. Unsupported or ambiguous
-dependencies remain visible as external or unresolved items rather than being
-guessed. See [architecture](docs/architecture.md) for current extraction and
-resolution limits.
+TypeScript imports and for unambiguous Python modules. Python also records
+conservative import bindings, direct calls, class bases, annotation type uses,
+and decorators as resolved, external, ambiguous, or unresolved references.
+OKF rolls these references up into Python module or package concepts; it does
+not create a document for every symbol or call. Unsupported or ambiguous
+behavior remains visible rather than being guessed. See
+[architecture](docs/architecture.md) for current limits.
 
 ## Development
 

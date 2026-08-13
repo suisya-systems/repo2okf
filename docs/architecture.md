@@ -8,7 +8,7 @@ Open Knowledge Format (OKF) v0.2. `repo2okf` is a working product name.
 ```text
 repository
   -> deterministic scanner
-  -> RepositoryIr + evidence graph
+  -> RepositoryIr + evidence-backed syntax/semantic graph
   -> coverage planner
   -> optional isolated Codex or Claude Code enrichment
   -> claim validator and bounded repair loop
@@ -35,6 +35,8 @@ repository
    require explicit user opt-in. Both return structured claim candidates
    through stdout; the host validates and writes them.
 3. Every accepted semantic claim contains at least one resolvable evidence ID.
+   Resolved semantic relationships retain their exact source occurrence, while
+   ambiguous and unresolved references remain explicit rather than guessed.
 4. Every scanned coverage item is classified as included, excluded with a
    reason, or unresolved.
 5. A facts-only unchanged-build skip must be byte-equivalent to a clean
@@ -76,13 +78,41 @@ The Python scanner extracts classes, functions (including nested functions),
 and direct class-body methods as evidence-backed entities. It also accounts for
 each `import` and `from ... import ...` statement as an evidence-backed import
 record. Relative imports and absolute package/module imports that uniquely
-match a scanned repository source file resolve to that source concept. Missing,
-ambiguous, root-escaping, and case-mismatched local imports remain explicit
-unresolved coverage items. Standard-library and third-party Python imports stay
-external references. A dots-only form such as `from . import util` records a
-dependency on the current package initializer; it does not guess whether
-`util` is a package attribute or a same-named submodule. `from __future__`
-remains a compiler directive and never resolves to a shadowing repository file.
+match a scanned repository source file resolve to that file in the IR. OKF
+keeps source-file concepts for evidence and coverage and adds logical Python
+module/package concepts; semantic relationships are rolled up between those
+logical concepts. Missing, ambiguous, root-escaping, and case-mismatched local
+imports remain explicit unresolved coverage items. Standard-library and
+third-party Python imports stay external references. A dots-only form such as
+`from . import util` records a dependency on the current package initializer;
+it does not guess whether `util` is a package attribute or a same-named
+submodule. `from __future__` remains a compiler directive and never resolves to
+a shadowing repository file.
+
+The Python semantic adapter adds deterministic ownership and qualified names,
+then inventories architecture-relevant import bindings, direct call targets,
+class bases, annotation type uses and decorators. Each reference is classified
+as resolved, external, ambiguous or unresolved. Only a uniquely resolved
+reference produces a semantic relationship. Dynamic member dispatch,
+reflection, wildcard imports and runtime rebinding are not guessed. Detailed
+occurrences remain in `RepositoryIr`; OKF rolls cross-concept relationships up
+and retains their source relationship, origin reference and evidence IDs rather
+than creating one document per symbol or line.
+
+Definitions and imports introduced only through conditional control flow remain
+unresolved in the Python MVP. The adapter does not infer branch execution or
+control-flow dominance merely from source order.
+
+Optional agents receive a bounded, host-computed view of this semantic graph.
+They may group connected entities into architecture components and propose
+evidence-backed `depends_on` links. The host derives final IDs, relationship
+evidence, status, and provenance. Concept candidates must cite exactly the
+declaration evidence for every member plus the evidence on every supporting
+edge; the host rejects missing, fabricated, unsupplied, or unrelated citations.
+Accepted architecture records always remain `draft`; a second agent is still
+an interpretation review, not mechanical verification. When the supplied graph
+is incomplete, a repository-wide summary is rejected and the partial scope is
+recorded.
 
 For Python classes, functions, and methods, a leading docstring expression is
 captured as its own exact `EvidenceRef`. Facts-only scanning emits a claim that
@@ -99,12 +129,13 @@ in this release.
 
 ## Initial public contracts
 
-The core crate exposes `scan_repository`, `RepositoryIr`, `Claim`,
-`EvidenceRef`, `CoverageReport`, `BuildState` and `compute_changes`.
+The core crate exposes `scan_repository`, `RepositoryIr`, `SemanticReference`,
+`SemanticResolution`, `ArchitectureScope`, `Claim`, `EvidenceRef`,
+`CoverageReport`, `BuildState` and `compute_changes`.
 
 The agent crate exposes `AgentDriver`, `CodexDriver`, `ClaudeDriver`,
-`AgentKind`, `AgentCapabilities`, `EnrichmentRequest`, `EnrichmentResponse` and
-`enrich_with_repair`.
+`AgentKind`, `AgentCapabilities`, `EnrichmentRequest`, `EnrichmentResponse`,
+`ConceptCandidate`, `RelationshipCandidate` and `enrich_with_repair`.
 
 The format crate exposes `emit_okf`, `verify_okf`, `OkfDocument`,
 `VerificationReport` and `VerifyOptions`.

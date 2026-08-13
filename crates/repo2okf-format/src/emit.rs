@@ -11,7 +11,8 @@ use thiserror::Error;
 
 use crate::model::{
     CoverageClassification, DocumentPathError, EvidenceRecord, OKF_VERSION, OkfDocument, OkfSource,
-    Repo2OkfMetadata, RepositoryIrView, concept_path,
+    ProjectedSemanticRelationship, Repo2OkfMetadata, RepositoryIrView, SemanticInventory,
+    concept_path,
 };
 
 /// Summary of a successful emission.
@@ -122,6 +123,76 @@ pub enum EmitError {
         /// Missing target ID.
         target: String,
     },
+    /// A repository-derived relationship has no evidence for its source occurrence.
+    #[error("relationship in `{concept_id}` to `{target}` has no evidence")]
+    RelationshipWithoutEvidence {
+        /// Source concept ID.
+        concept_id: String,
+        /// Target concept ID.
+        target: String,
+    },
+    /// A resolved semantic relationship is missing its origin reference.
+    #[error(
+        "semantic relationship `{kind}` in `{concept_id}` to `{target}` has no origin reference"
+    )]
+    SemanticRelationshipWithoutOrigin {
+        /// Source concept ID.
+        concept_id: String,
+        /// Target concept ID.
+        target: String,
+        /// Semantic relationship kind.
+        kind: String,
+    },
+    /// A generated semantic relationship is missing its repository graph edge.
+    #[error(
+        "semantic relationship {kind} in {concept_id} to {target} has no graph relationship ID"
+    )]
+    SemanticRelationshipWithoutGraphEdge {
+        /// Source concept ID.
+        concept_id: String,
+        /// Target concept ID.
+        target: String,
+        /// Semantic relationship kind.
+        kind: String,
+    },
+    /// A repository-derived relationship contains an empty provenance ID.
+    #[error("relationship in `{concept_id}` to `{target}` has an empty {field}")]
+    InvalidRelationshipProvenance {
+        /// Source concept ID.
+        concept_id: String,
+        /// Target concept ID.
+        target: String,
+        /// Invalid provenance field.
+        field: &'static str,
+    },
+    /// A projected edge references a relationship absent from the repository graph.
+    #[error("relationship in `{concept_id}` to `{target}` cites unknown graph edge `{id}`")]
+    UnknownGraphRelationship {
+        /// Source concept ID.
+        concept_id: String,
+        /// Target concept ID.
+        target: String,
+        /// Missing graph relationship ID.
+        id: String,
+    },
+    /// A semantic edge references a missing or non-resolved origin reference.
+    #[error(
+        "semantic relationship in `{concept_id}` to `{target}` cites non-resolved reference `{id}`"
+    )]
+    UnknownResolvedReference {
+        /// Source concept ID.
+        concept_id: String,
+        /// Target concept ID.
+        target: String,
+        /// Missing or non-resolved semantic reference ID.
+        id: String,
+    },
+    /// Generated semantic relationships differ from the exhaustive adapter projection.
+    #[error("semantic projection contract mismatch: {reason}")]
+    SemanticProjectionMismatch {
+        /// Missing, unexpected, or altered projection description.
+        reason: String,
+    },
     /// An exclusion must explain why the item is intentionally absent.
     #[error("coverage item `{0}` has an empty exclusion reason")]
     EmptyExclusionReason(String),
@@ -165,7 +236,7 @@ where
     let evidence = evidence_map(ir.evidence_records())?;
     let mut documents = ir.okf_documents().to_vec();
 
-    validate_and_normalize_documents(&mut documents, &evidence)?;
+    validate_and_normalize_documents(&mut documents, &evidence, ir.semantic_inventory())?;
     documents.sort_by_key(|document| portable_id(&document.id));
     validate_relationships(&documents)?;
     validate_coverage(ir.coverage_items(), &documents)?;
@@ -206,10 +277,11 @@ where
 fn validate_and_normalize_documents(
     documents: &mut [OkfDocument],
     evidence: &BTreeMap<&str, &EvidenceRecord>,
+    semantic_inventory: Option<&SemanticInventory>,
 ) -> Result<(), EmitError> {
     let mut document_ids = BTreeSet::new();
     let mut claim_ids = BTreeSet::new();
-    for document in documents {
+    for document in &mut *documents {
         concept_path(&document.id).map_err(|source| EmitError::InvalidConceptId {
             id: document.id.clone(),
             source,
@@ -221,7 +293,53 @@ fn validate_and_normalize_documents(
             return Err(EmitError::EmptyConceptType(document.id.clone()));
         }
 
-        normalize_document(document, evidence, &mut claim_ids)?;
+        normalize_document(document, evidence, semantic_inventory, &mut claim_ids)?;
+    }
+    validate_projection_contract(documents, semantic_inventory)?;
+    Ok(())
+}
+
+fn validate_projection_contract(
+    documents: &[OkfDocument],
+    semantic_inventory: Option<&SemanticInventory>,
+) -> Result<(), EmitError> {
+    let Some(inventory) =
+        semantic_inventory.filter(|inventory| inventory.projection_contract_complete)
+    else {
+        return Ok(());
+    };
+    let expected = inventory
+        .projected_relationships
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let actual = documents
+        .iter()
+        .flat_map(|document| {
+            document
+                .relationships
+                .iter()
+                .filter(|relationship| is_projection_contract_relationship(relationship))
+                .map(|relationship| {
+                    ProjectedSemanticRelationship::from_okf(&document.id, relationship)
+                })
+        })
+        .collect::<BTreeSet<_>>();
+    if let Some(missing) = expected.difference(&actual).next() {
+        return Err(EmitError::SemanticProjectionMismatch {
+            reason: format!(
+                "missing {} --{}--> {}",
+                missing.source_concept_id, missing.kind, missing.target_concept_id
+            ),
+        });
+    }
+    if let Some(unexpected) = actual.difference(&expected).next() {
+        return Err(EmitError::SemanticProjectionMismatch {
+            reason: format!(
+                "unexpected {} --{}--> {}",
+                unexpected.source_concept_id, unexpected.kind, unexpected.target_concept_id
+            ),
+        });
     }
     Ok(())
 }
@@ -230,6 +348,7 @@ fn validate_and_normalize_documents(
 fn normalize_document(
     document: &mut OkfDocument,
     evidence: &BTreeMap<&str, &EvidenceRecord>,
+    semantic_inventory: Option<&SemanticInventory>,
     claim_ids: &mut BTreeSet<String>,
 ) -> Result<(), EmitError> {
     validate_metadata(document)?;
@@ -239,11 +358,218 @@ fn normalize_document(
         .metadata
         .verified
         .sort_by(|left, right| left.at.cmp(&right.at).then_with(|| left.by.cmp(&right.by)));
+    let mut architecture_evidence = Vec::new();
+    if let Some(architecture) = document
+        .metadata
+        .repo2okf
+        .as_mut()
+        .and_then(|extension| extension.architecture.as_mut())
+    {
+        architecture.member_entity_ids.sort();
+        architecture.member_entity_ids.dedup();
+        architecture.supporting_relationship_ids.sort();
+        architecture.supporting_relationship_ids.dedup();
+        architecture.evidence_ids.sort();
+        architecture.evidence_ids.dedup();
+        if document.metadata.status != Some(crate::model::OkfStatus::Draft) {
+            return Err(EmitError::InvalidMetadata {
+                concept_id: document.id.clone(),
+                reason: "agent architecture concepts must remain draft".to_owned(),
+            });
+        }
+        if !document
+            .metadata
+            .generated
+            .as_ref()
+            .is_some_and(|event| is_agent_actor(&event.by))
+        {
+            return Err(EmitError::InvalidMetadata {
+                concept_id: document.id.clone(),
+                reason: "architecture concepts require agent provenance".to_owned(),
+            });
+        }
+        if architecture.source_concept_id.trim().is_empty()
+            || architecture.member_entity_ids.len() < 2
+            || architecture.supporting_relationship_ids.is_empty()
+            || architecture.evidence_ids.is_empty()
+        {
+            return Err(EmitError::InvalidMetadata {
+                concept_id: document.id.clone(),
+                reason: "architecture concept lacks graph members, support, or evidence".to_owned(),
+            });
+        }
+        if let Some(inventory) = semantic_inventory {
+            if !inventory
+                .architecture_concept_ids
+                .iter()
+                .any(|known| known == &architecture.source_concept_id)
+            {
+                return Err(EmitError::InvalidMetadata {
+                    concept_id: document.id.clone(),
+                    reason: format!(
+                        "architecture source concept '{}' is absent from the repository IR",
+                        architecture.source_concept_id
+                    ),
+                });
+            }
+            if let Some(id) = architecture
+                .member_entity_ids
+                .iter()
+                .find(|id| !inventory.entity_ids.iter().any(|known| known == *id))
+            {
+                return Err(EmitError::InvalidMetadata {
+                    concept_id: document.id.clone(),
+                    reason: format!("architecture member '{id}' is absent from the repository IR"),
+                });
+            }
+            if architecture.scope != inventory.architecture_scope {
+                return Err(EmitError::InvalidMetadata {
+                    concept_id: document.id.clone(),
+                    reason: "architecture scope differs from the repository IR".to_owned(),
+                });
+            }
+            if let Some(id) = architecture
+                .supporting_relationship_ids
+                .iter()
+                .find(|id| !inventory.relationship_ids.iter().any(|known| known == *id))
+            {
+                return Err(EmitError::InvalidMetadata {
+                    concept_id: document.id.clone(),
+                    reason: format!(
+                        "architecture support edge '{id}' is absent from the repository IR"
+                    ),
+                });
+            }
+        }
+        for evidence_id in &architecture.evidence_ids {
+            let record =
+                evidence
+                    .get(evidence_id.as_str())
+                    .ok_or_else(|| EmitError::UnknownEvidence {
+                        owner: format!("architecture:{}", architecture.source_concept_id),
+                        evidence_id: evidence_id.clone(),
+                    })?;
+            architecture_evidence.push((*record).clone());
+        }
+    }
+    let mut relationship_evidence = Vec::new();
+    for relationship in &mut document.relationships {
+        relationship.source_relationship_ids.sort();
+        relationship.source_relationship_ids.dedup();
+        relationship.origin_reference_ids.sort();
+        relationship.origin_reference_ids.dedup();
+        relationship.evidence_ids.sort();
+        relationship.evidence_ids.dedup();
+
+        for (field, ids) in [
+            (
+                "source_relationship_ids[]",
+                relationship.source_relationship_ids.as_slice(),
+            ),
+            (
+                "origin_reference_ids[]",
+                relationship.origin_reference_ids.as_slice(),
+            ),
+            ("evidence_ids[]", relationship.evidence_ids.as_slice()),
+        ] {
+            if ids.iter().any(|id| id.trim().is_empty()) {
+                return Err(EmitError::InvalidRelationshipProvenance {
+                    concept_id: document.id.clone(),
+                    target: relationship.target.clone(),
+                    field,
+                });
+            }
+        }
+        let derived = !relationship.source_relationship_ids.is_empty()
+            || !relationship.origin_reference_ids.is_empty()
+            || !relationship.evidence_ids.is_empty();
+        if derived && relationship.evidence_ids.is_empty() {
+            return Err(EmitError::RelationshipWithoutEvidence {
+                concept_id: document.id.clone(),
+                target: relationship.target.clone(),
+            });
+        }
+        let semantic = relationship
+            .kind
+            .as_deref()
+            .is_some_and(is_semantic_relationship_kind);
+        if semantic && (semantic_inventory.is_some() || derived) {
+            if relationship.source_relationship_ids.is_empty() {
+                return Err(EmitError::SemanticRelationshipWithoutGraphEdge {
+                    concept_id: document.id.clone(),
+                    target: relationship.target.clone(),
+                    kind: relationship.kind.clone().unwrap_or_default(),
+                });
+            }
+            if relationship.origin_reference_ids.is_empty() {
+                return Err(EmitError::SemanticRelationshipWithoutOrigin {
+                    concept_id: document.id.clone(),
+                    target: relationship.target.clone(),
+                    kind: relationship.kind.clone().unwrap_or_default(),
+                });
+            }
+        }
+        if let Some(inventory) = semantic_inventory {
+            for id in &relationship.source_relationship_ids {
+                if !inventory.relationship_ids.iter().any(|known| known == id) {
+                    return Err(EmitError::UnknownGraphRelationship {
+                        concept_id: document.id.clone(),
+                        target: relationship.target.clone(),
+                        id: id.clone(),
+                    });
+                }
+            }
+            for id in &relationship.origin_reference_ids {
+                if !inventory
+                    .resolved_reference_ids
+                    .iter()
+                    .any(|known| known == id)
+                {
+                    return Err(EmitError::UnknownResolvedReference {
+                        concept_id: document.id.clone(),
+                        target: relationship.target.clone(),
+                        id: id.clone(),
+                    });
+                }
+            }
+            if inventory.projection_contract_complete
+                && is_projection_contract_relationship(relationship)
+            {
+                let projected = ProjectedSemanticRelationship::from_okf(&document.id, relationship);
+                if !inventory.projected_relationships.contains(&projected) {
+                    return Err(EmitError::SemanticProjectionMismatch {
+                        reason: format!(
+                            "{} --{}--> {} does not match its canonical repository projection",
+                            document.id,
+                            relationship.kind.as_deref().unwrap_or_default(),
+                            relationship.target,
+                        ),
+                    });
+                }
+            }
+        }
+        for evidence_id in &relationship.evidence_ids {
+            let record =
+                evidence
+                    .get(evidence_id.as_str())
+                    .ok_or_else(|| EmitError::UnknownEvidence {
+                        owner: format!("{} -> {}", document.id, relationship.target),
+                        evidence_id: evidence_id.clone(),
+                    })?;
+            relationship_evidence.push((*record).clone());
+        }
+    }
     document.relationships.sort_by(|left, right| {
         left.target
             .cmp(&right.target)
             .then_with(|| left.kind.cmp(&right.kind))
             .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| {
+                left.source_relationship_ids
+                    .cmp(&right.source_relationship_ids)
+            })
+            .then_with(|| left.origin_reference_ids.cmp(&right.origin_reference_ids))
+            .then_with(|| left.evidence_ids.cmp(&right.evidence_ids))
     });
     document.relationships.dedup();
     document
@@ -292,6 +618,12 @@ fn normalize_document(
     for record in &claim_evidence {
         ensure_evidence_source(document, record);
     }
+    for record in &relationship_evidence {
+        ensure_evidence_source(document, record);
+    }
+    for record in &architecture_evidence {
+        ensure_evidence_source(document, record);
+    }
 
     if (document.claims.iter().any(|claim| claim.ai_generated)
         || document
@@ -332,13 +664,21 @@ fn normalize_document(
             .then_with(|| left.resource.cmp(&right.resource))
     });
     document.metadata.sources.dedup();
-    document.metadata.repo2okf = if document.claims.is_empty() && document.relationships.is_empty()
+    let architecture = document
+        .metadata
+        .repo2okf
+        .as_ref()
+        .and_then(|extension| extension.architecture.clone());
+    document.metadata.repo2okf = if document.claims.is_empty()
+        && document.relationships.is_empty()
+        && architecture.is_none()
     {
         None
     } else {
         Some(Repo2OkfMetadata {
             claims: document.claims.clone(),
             relationships: document.relationships.clone(),
+            architecture,
         })
     };
     Ok(())
@@ -594,6 +934,13 @@ fn validate_coverage(
 fn render_document(document: &OkfDocument) -> Result<String, EmitError> {
     let mut rendered = render_frontmatter(&document.metadata)?;
     let body = document.body.trim();
+    let source_ids = document
+        .metadata
+        .sources
+        .iter()
+        .filter_map(|source| source.evidence_id.as_deref().zip(source.id.as_deref()))
+        .collect::<BTreeMap<_, _>>();
+    let mut cited_source_ids = BTreeSet::new();
     if !body.is_empty() {
         rendered.push('\n');
         rendered.push_str(body);
@@ -611,42 +958,49 @@ fn render_document(document: &OkfDocument) -> Result<String, EmitError> {
                 .kind
                 .as_deref()
                 .map_or_else(String::new, |kind| format!(" — {kind}"));
+            let citations = relationship
+                .evidence_ids
+                .iter()
+                .filter_map(|evidence_id| source_ids.get(evidence_id.as_str()))
+                .fold(String::new(), |mut citations, source_id| {
+                    cited_source_ids.insert(*source_id);
+                    write!(citations, "[^{source_id}]").expect("writing to a String cannot fail");
+                    citations
+                });
             writeln!(
                 rendered,
-                "- [{}](/{}.md){}",
+                "- [{}](/{}.md){}{}",
                 escape_markdown_label(label),
                 encode_concept_link_target(&relationship.target),
-                escape_markdown_inline(&kind)
+                escape_markdown_inline(&kind),
+                citations
             )
             .expect("writing to a String cannot fail");
         }
     }
 
     if !document.claims.is_empty() {
-        let source_ids = document
-            .metadata
-            .sources
-            .iter()
-            .filter_map(|source| source.evidence_id.as_deref().zip(source.id.as_deref()))
-            .collect::<BTreeMap<_, _>>();
         rendered.push_str("\n## Evidence-bound claims\n\n");
         for claim in &document.claims {
             rendered.push_str("- ");
             rendered.push_str(&escape_markdown_text(claim.text.trim()));
             for evidence_id in &claim.evidence_ids {
                 if let Some(source_id) = source_ids.get(evidence_id.as_str()) {
+                    cited_source_ids.insert(*source_id);
                     write!(rendered, "[^{source_id}]").expect("writing to a String cannot fail");
                 }
             }
             rendered.push('\n');
         }
+    }
+
+    if !cited_source_ids.is_empty() {
         rendered.push('\n');
-        let mut written = BTreeSet::new();
         for source in &document.metadata.sources {
             let Some(source_id) = source.id.as_deref() else {
                 continue;
             };
-            if source.evidence_id.is_none() || !written.insert(source_id) {
+            if source.evidence_id.is_none() || !cited_source_ids.contains(source_id) {
                 continue;
             }
             let title = source.title.as_deref().unwrap_or(&source.resource);
@@ -732,6 +1086,16 @@ fn portable_id(id: &str) -> String {
         .unwrap_or(id)
         .replace('\\', "/")
         .to_lowercase()
+}
+
+fn is_semantic_relationship_kind(kind: &str) -> bool {
+    matches!(kind, "calls" | "extends" | "type_uses" | "decorated_by")
+}
+
+fn is_projection_contract_relationship(relationship: &crate::model::OkfRelationship) -> bool {
+    !relationship.origin_reference_ids.is_empty()
+        || (relationship.kind.as_deref() == Some("depends_on")
+            && !relationship.source_relationship_ids.is_empty())
 }
 
 fn is_independent_verifier(actor: &str) -> bool {

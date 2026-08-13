@@ -3,7 +3,8 @@
 use std::fs;
 
 use repo2okf_core::{
-    ClaimProvenance, EntityKind, EvidenceRef, Language, ScanOptions, ScanStatus, scan_repository,
+    ClaimProvenance, EntityKind, EvidenceRef, Language, RelationshipOrigin, ScanOptions,
+    ScanStatus, SemanticReferenceKind, SemanticResolution, scan_repository,
 };
 
 #[test]
@@ -343,6 +344,26 @@ fn dots_only_from_import_resolves_to_the_package_not_a_guessed_submodule() {
         .expect("package import relationship");
     assert_eq!(relationship.target, package.id);
     assert_ne!(relationship.target, submodule.id);
+    let binding = ir
+        .semantic_references
+        .iter()
+        .find(|reference| {
+            reference.kind == SemanticReferenceKind::ImportBinding
+                && reference.path == "pkg/consumer.py"
+                && reference.binding_name.as_deref() == Some("util")
+        })
+        .expect("dots-only semantic import binding");
+    assert!(matches!(
+        binding.resolution,
+        SemanticResolution::Unresolved { .. }
+    ));
+    assert!(ir.relationships.iter().all(|relationship| {
+        !matches!(
+            &relationship.origin,
+            RelationshipOrigin::SemanticReference { reference_id }
+                if reference_id == &binding.id
+        )
+    }));
     ir.validate().expect("valid IR");
 }
 

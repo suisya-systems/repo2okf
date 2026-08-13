@@ -330,6 +330,9 @@ fn compile(
             },
         )?;
         repository.verify()?;
+        let (concepts, relationships) = response.accepted_architecture(driver.kind());
+        ir.set_architecture_with_scope(concepts, relationships, stats.architecture_scope.clone())
+            .map_err(anyhow::Error::msg)?;
         ir.extend_claims(response.claims)
             .map_err(anyhow::Error::msg)?;
         println!(
@@ -361,6 +364,13 @@ fn compile(
             repository.verify()?;
             ir.claims
                 .retain(|claim| matches!(claim.provenance, ClaimProvenance::Deterministic { .. }));
+            let (concepts, relationships) = review_response.accepted_architecture(reviewer.kind());
+            ir.set_architecture_with_scope(
+                concepts,
+                relationships,
+                review_stats.architecture_scope.clone(),
+            )
+            .map_err(anyhow::Error::msg)?;
             ir.extend_claims(review_response.claims)
                 .map_err(anyhow::Error::msg)?;
             println!(
@@ -525,6 +535,15 @@ fn verify(repository: &io::RepositoryGuard, config: &Config, args: &VerifyArgs) 
 }
 
 fn coverage(repository: &io::RepositoryGuard, config: &Config, args: &CoverageArgs) -> Result<()> {
+    #[derive(Serialize)]
+    struct CoverageOutput<'a> {
+        #[serde(flatten)]
+        source: &'a repo2okf_core::CoverageReport,
+        semantic: &'a repo2okf_core::SemanticCoverage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        architecture_scope: Option<&'a repo2okf_core::ArchitectureScope>,
+    }
+
     repository.verify()?;
     let path = io::resolve_beneath(repository.path(), &config.output.ir_file)?;
     let ir: RepositoryIr = io::read_json(&path).with_context(|| {
@@ -535,12 +554,54 @@ fn coverage(repository: &io::RepositoryGuard, config: &Config, args: &CoverageAr
     })?;
     repository.verify()?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&ir.coverage)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&CoverageOutput {
+                source: &ir.coverage,
+                semantic: &ir.semantic_coverage,
+                architecture_scope: ir.architecture_scope.as_ref(),
+            })?
+        );
     } else {
         println!("included:   {}", ir.coverage.included);
         println!("excluded:   {}", ir.coverage.excluded);
         println!("unresolved: {}", ir.coverage.unresolved);
         println!("coverage:   {:.1}%", ir.coverage.ratio() * 100.0);
+        println!("semantic references: {}", ir.semantic_coverage.total);
+        println!("  resolved:   {}", ir.semantic_coverage.resolved);
+        println!("  external:   {}", ir.semantic_coverage.external_);
+        println!("  ambiguous:  {}", ir.semantic_coverage.ambiguous);
+        println!("  unresolved: {}", ir.semantic_coverage.unresolved);
+        if let Some(scope) = &ir.architecture_scope {
+            println!(
+                "architecture input: {}",
+                if scope.complete {
+                    "complete"
+                } else {
+                    "partial"
+                }
+            );
+            println!(
+                "  evidence:      {}/{}",
+                scope.evidence_supplied, scope.evidence_total
+            );
+            println!(
+                "  coverage items: {}/{}",
+                scope.coverage_items_supplied, scope.coverage_items_total
+            );
+            println!(
+                "  entities:      {}/{}",
+                scope.entities_supplied, scope.entities_total
+            );
+            println!(
+                "  references:    {}/{}",
+                scope.semantic_references_supplied, scope.semantic_references_total
+            );
+            println!(
+                "  relationships: {}/{}",
+                scope.semantic_relationships_supplied, scope.semantic_relationships_total
+            );
+        }
         for item in &ir.coverage.items {
             if matches!(
                 item.disposition,
@@ -928,6 +989,7 @@ fn verification_options(
                 .map(|document| document.id.clone())
                 .collect()
         }),
+        semantic_inventory: snapshot.and_then(|snapshot| snapshot.semantic_inventory.clone()),
         freshness_mismatches,
         ..VerifyOptions::default()
     }
@@ -990,6 +1052,8 @@ fn deterministic_ir_matches(saved: &RepositoryIr, current: &RepositoryIr) -> boo
         && saved.imports == current.imports
         && saved.evidence == current.evidence
         && saved.relationships == current.relationships
+        && saved.semantic_references == current.semantic_references
+        && saved.semantic_coverage == current.semantic_coverage
         && saved.coverage == current.coverage
         && saved
             .claims
