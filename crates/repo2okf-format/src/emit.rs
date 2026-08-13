@@ -166,7 +166,7 @@ where
     let mut documents = ir.okf_documents().to_vec();
 
     validate_and_normalize_documents(&mut documents, &evidence)?;
-    documents.sort_by(|left, right| portable_id(&left.id).cmp(&portable_id(&right.id)));
+    documents.sort_by_key(|document| portable_id(&document.id));
     validate_relationships(&documents)?;
     validate_coverage(ir.coverage_items(), &documents)?;
 
