@@ -1,0 +1,2 @@
+* text=auto
+crates/repo2okf-format/tests/golden/*.md text eol=lf

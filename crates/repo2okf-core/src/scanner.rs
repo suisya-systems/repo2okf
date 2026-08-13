@@ -1730,9 +1730,7 @@ fn stable_hash(parts: &[&str]) -> String {
 }
 
 fn one_based_row(row: usize) -> u32 {
-    u32::try_from(row)
-        .map(|value| value.saturating_add(1))
-        .unwrap_or(u32::MAX)
+    u32::try_from(row).map_or(u32::MAX, |value| value.saturating_add(1))
 }
 
 const fn entity_kind_label(kind: EntityKind) -> &'static str {

@@ -122,6 +122,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 ```
 
-The project is licensed under Apache-2.0.
+The project is licensed under the MIT License.
 
 [okf]: https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf
