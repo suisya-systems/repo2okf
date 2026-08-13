@@ -138,6 +138,55 @@ pub struct Repo2OkfMetadata {
     /// Structured relationships rendered as standard Markdown links.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relationships: Vec<OkfRelationship>,
+    /// Agent-proposed architecture grouping represented by this draft concept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<OkfArchitectureConcept>,
+}
+
+/// Graph support retained for an agent-proposed architecture concept.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OkfArchitectureConcept {
+    /// Host-assigned concept ID in the repository IR.
+    pub source_concept_id: String,
+    /// Deterministic repository entities grouped by the interpretation.
+    #[serde(default)]
+    pub member_entity_ids: Vec<String>,
+    /// Resolved semantic edges establishing cohesion.
+    #[serde(default)]
+    pub supporting_relationship_ids: Vec<String>,
+    /// Evidence derived by the host from the members and supporting edges.
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    /// Host-computed bounds of the semantic graph supplied to the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ArchitectureScope>,
+}
+
+/// Portable copy of the host-computed architecture synthesis scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchitectureScope {
+    /// Total evidence records available to architecture synthesis.
+    pub evidence_total: usize,
+    /// Evidence records supplied to the agent.
+    pub evidence_supplied: usize,
+    /// Total ordinary coverage items available to architecture synthesis.
+    pub coverage_items_total: usize,
+    /// Ordinary coverage items supplied to the agent.
+    pub coverage_items_supplied: usize,
+    /// Total source entities available to architecture synthesis.
+    pub entities_total: usize,
+    /// Source entities supplied to the agent.
+    pub entities_supplied: usize,
+    /// Total semantic references available to architecture synthesis.
+    pub semantic_references_total: usize,
+    /// Semantic references supplied to the agent.
+    pub semantic_references_supplied: usize,
+    /// Total resolved semantic relationships available to architecture synthesis.
+    pub semantic_relationships_total: usize,
+    /// Resolved semantic relationships supplied to the agent.
+    pub semantic_relationships_supplied: usize,
+    /// Whether the supplied graph was complete and untruncated.
+    pub complete: bool,
 }
 
 /// A stable source entry in a concept's provenance.
@@ -223,6 +272,21 @@ pub struct OkfRelationship {
     /// Producer-defined relationship kind. OKF links themselves are untyped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Stable repository-IR relationship IDs represented by this concept edge.
+    ///
+    /// Several symbol-level relationships may roll up into one concept-level
+    /// relationship. Plain, hand-authored OKF links may leave this empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_relationship_ids: Vec<String>,
+    /// Semantic-reference IDs from which the represented resolved edges arose.
+    ///
+    /// Observed syntax relationships and plain OKF links do not require an
+    /// origin reference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin_reference_ids: Vec<String>,
+    /// Evidence for the source occurrences establishing this relationship.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ids: Vec<String>,
 }
 
 /// A semantic assertion and its `Repo2OKF` evidence bindings.
@@ -320,6 +384,78 @@ pub struct RepositorySnapshot {
     /// Complete coverage classification.
     #[serde(default)]
     pub coverage: Vec<CoverageItem>,
+    /// Optional graph inventory used to validate projected semantic IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_inventory: Option<SemanticInventory>,
+}
+
+/// IDs available to the format layer for semantic projection validation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticInventory {
+    /// All repository graph entity IDs.
+    #[serde(default)]
+    pub entity_ids: Vec<String>,
+    /// All resolved graph relationship IDs.
+    #[serde(default)]
+    pub relationship_ids: Vec<String>,
+    /// Semantic-reference IDs whose resolution has exactly one target.
+    #[serde(default)]
+    pub resolved_reference_ids: Vec<String>,
+    /// All persisted architecture concept IDs.
+    #[serde(default)]
+    pub architecture_concept_ids: Vec<String>,
+    /// Whether `projected_relationships` is an exhaustive projection contract.
+    ///
+    /// `false` preserves snapshots serialized before this contract existed;
+    /// `true` makes even an empty expected set authoritative.
+    #[serde(default)]
+    pub projection_contract_complete: bool,
+    /// Canonical repository-derived relationships projected into OKF concepts.
+    ///
+    /// Empty inventories retain compatibility with snapshots produced before
+    /// exact semantic projection validation was available.
+    #[serde(default)]
+    pub projected_relationships: Vec<ProjectedSemanticRelationship>,
+    /// Exact scope expected on every projected architecture concept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture_scope: Option<ArchitectureScope>,
+}
+
+/// One canonical semantic relationship after symbol-to-concept aggregation.
+///
+/// The adapter computes these records from the deterministic repository graph.
+/// The emitter and verifier compare the complete tuple so valid graph IDs cannot
+/// be detached from their actual source, target, kind, origin, or evidence.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ProjectedSemanticRelationship {
+    /// OKF concept containing the projected relationship.
+    pub source_concept_id: String,
+    /// OKF concept targeted by the projected relationship.
+    pub target_concept_id: String,
+    /// Normalized relationship kind emitted in `repo2okf.relationships`.
+    pub kind: String,
+    /// Deterministic repository relationship IDs aggregated into this edge.
+    #[serde(default)]
+    pub source_relationship_ids: Vec<String>,
+    /// Resolved semantic-reference IDs that produced those relationships.
+    #[serde(default)]
+    pub origin_reference_ids: Vec<String>,
+    /// Source evidence attached to the aggregated relationship.
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+}
+
+impl ProjectedSemanticRelationship {
+    pub(crate) fn from_okf(source_concept_id: &str, relationship: &OkfRelationship) -> Self {
+        Self {
+            source_concept_id: source_concept_id.to_owned(),
+            target_concept_id: relationship.target.clone(),
+            kind: relationship.kind.clone().unwrap_or_default(),
+            source_relationship_ids: relationship.source_relationship_ids.clone(),
+            origin_reference_ids: relationship.origin_reference_ids.clone(),
+            evidence_ids: relationship.evidence_ids.clone(),
+        }
+    }
 }
 
 /// Minimal read-only view needed to emit OKF from a repository IR.
@@ -332,6 +468,10 @@ pub trait RepositoryIrView {
     fn evidence_records(&self) -> &[EvidenceRecord];
     /// Coverage classifications.
     fn coverage_items(&self) -> &[CoverageItem];
+    /// Optional semantic graph inventory for validating projected IDs.
+    fn semantic_inventory(&self) -> Option<&SemanticInventory> {
+        None
+    }
 }
 
 impl RepositoryIrView for RepositorySnapshot {
@@ -349,6 +489,10 @@ impl RepositoryIrView for RepositorySnapshot {
 
     fn coverage_items(&self) -> &[CoverageItem] {
         &self.coverage
+    }
+
+    fn semantic_inventory(&self) -> Option<&SemanticInventory> {
+        self.semantic_inventory.as_ref()
     }
 }
 

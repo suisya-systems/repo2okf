@@ -18,8 +18,9 @@ use crate::python_resolver::resolve_python_imports;
 use crate::{
     Claim, ClaimProvenance, CoverageDisposition, CoverageItem, CoverageKind, CoverageReport,
     EXTRACTOR_VERSION, Entity, EntityKind, EvidenceRef, FileRecord, IR_SCHEMA_VERSION,
-    ImportRecord, Language, Relationship, RelationshipKind, RepositoryIr, RepositoryMetadata,
-    ScanStatus,
+    ImportRecord, Language, Relationship, RelationshipKind, RelationshipOrigin, RepositoryIr,
+    RepositoryMetadata, ScanStatus, SemanticCoverage, SemanticReference, SemanticReferenceKind,
+    SemanticResolution,
 };
 
 /// Repository scan configuration.
@@ -143,6 +144,8 @@ struct FileExtraction {
     relationships: Vec<Relationship>,
     claims: Vec<Claim>,
     coverage: Vec<CoverageItem>,
+    semantic_references: Vec<SemanticReference>,
+    python_bindings: Vec<PythonBinding>,
 }
 
 #[derive(Debug)]
@@ -154,6 +157,9 @@ struct ParsedSymbol {
     start_line: u32,
     end_line: u32,
     docstring: Option<ParsedSpan>,
+    owner_start_byte: Option<usize>,
+    qualified_name: String,
+    conditional_binding: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -167,10 +173,67 @@ struct ParsedSpan {
 #[derive(Debug)]
 struct ParsedImport {
     specifier: String,
+    bindings: Vec<ParsedImportBinding>,
+    scope_start_byte: Option<usize>,
     start_byte: usize,
     end_byte: usize,
     start_line: u32,
     end_line: u32,
+    conditional_binding: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedImportBinding {
+    imported_name: String,
+    qualifier: Option<String>,
+    binding_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedSemanticReference {
+    kind: SemanticReferenceKind,
+    name: String,
+    qualifier: Option<String>,
+    binding_name: Option<String>,
+    span: ParsedSpan,
+    scope_start_byte: Option<usize>,
+    source_start_byte: Option<usize>,
+    forced_unresolved_reason: Option<&'static str>,
+}
+
+const PENDING_SEMANTIC_RESOLUTION_REASON: &str =
+    "semantic resolution is pending repository assembly";
+const PYTHON_COMPREHENSION_RESOLUTION_REASON: &str =
+    "Python comprehension scopes are intentionally unresolved in this semantic slice";
+const PYTHON_CONDITIONAL_BINDING_RESOLUTION_REASON: &str =
+    "Python conditional binding may not execute on every path";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PythonBindingKind {
+    Local,
+    Declaration,
+    Import,
+    ConditionalDeclaration,
+    ConditionalImport,
+    Delete,
+    Global,
+    Nonlocal,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedPythonBinding {
+    name: String,
+    scope_start_byte: Option<usize>,
+    kind: PythonBindingKind,
+    visible_after_byte: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PythonBinding {
+    name: String,
+    scope_id: String,
+    kind: PythonBindingKind,
+    visible_after_byte: u64,
 }
 
 #[derive(Debug)]
@@ -178,6 +241,8 @@ struct ParsedFile {
     symbols: Vec<ParsedSymbol>,
     imports: Vec<ParsedImport>,
     docstring: Option<ParsedSpan>,
+    semantic_references: Vec<ParsedSemanticReference>,
+    python_bindings: Vec<ParsedPythonBinding>,
 }
 
 /// Scan a repository without executing its code or build system.
@@ -219,6 +284,8 @@ pub fn scan_repository(root: &Path, options: &ScanOptions) -> Result<RepositoryI
     let mut relationships = Vec::new();
     let mut claims = Vec::new();
     let mut coverage_items = Vec::new();
+    let mut semantic_references = Vec::new();
+    let mut python_bindings = Vec::new();
     for extraction in extractions {
         files.push(extraction.file);
         entities.extend(extraction.entities);
@@ -227,6 +294,8 @@ pub fn scan_repository(root: &Path, options: &ScanOptions) -> Result<RepositoryI
         relationships.extend(extraction.relationships);
         claims.extend(extraction.claims);
         coverage_items.extend(extraction.coverage);
+        semantic_references.extend(extraction.semantic_references);
+        python_bindings.extend(extraction.python_bindings);
     }
 
     resolve_typescript_javascript_imports(
@@ -242,6 +311,13 @@ pub fn scan_repository(root: &Path, options: &ScanOptions) -> Result<RepositoryI
         &imports,
         &mut relationships,
         &mut coverage_items,
+    );
+    resolve_python_semantics(
+        &entities,
+        &evidence,
+        &python_bindings,
+        &mut semantic_references,
+        &mut relationships,
     );
 
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -263,6 +339,9 @@ pub fn scan_repository(root: &Path, options: &ScanOptions) -> Result<RepositoryI
     relationships.dedup_by(|left, right| left.id == right.id);
     claims.sort_by(|left, right| left.id.cmp(&right.id));
     claims.dedup_by(|left, right| left.id == right.id);
+    semantic_references.sort_by(|left, right| left.id.cmp(&right.id));
+    semantic_references.dedup_by(|left, right| left.id == right.id);
+    let semantic_coverage = SemanticCoverage::from_references(&semantic_references);
     let coverage = CoverageReport::from_items(coverage_items);
 
     let repository = RepositoryMetadata {
@@ -284,6 +363,8 @@ pub fn scan_repository(root: &Path, options: &ScanOptions) -> Result<RepositoryI
         &imports,
         &evidence,
         &relationships,
+        &semantic_references,
+        &semantic_coverage,
         &claims,
         &coverage,
     )?;
@@ -295,7 +376,12 @@ pub fn scan_repository(root: &Path, options: &ScanOptions) -> Result<RepositoryI
         imports,
         evidence,
         relationships,
+        semantic_references,
+        semantic_coverage,
         claims,
+        architecture_concepts: Vec::new(),
+        architecture_relationships: Vec::new(),
+        architecture_scope: None,
         coverage,
         fingerprint,
     };
@@ -384,6 +470,770 @@ fn resolve_typescript_javascript_imports(
                 .iter()
                 .any(|id| unresolved_evidence.contains(id.as_str()))
     });
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "repository-wide Python resolution setup and edge materialization stay auditable together"
+)]
+fn resolve_python_semantics(
+    entities: &[Entity],
+    evidence: &[EvidenceRef],
+    bindings: &[PythonBinding],
+    references: &mut [SemanticReference],
+    relationships: &mut Vec<Relationship>,
+) {
+    let entities_by_id = entities
+        .iter()
+        .map(|entity| (entity.id.as_str(), entity))
+        .collect::<BTreeMap<_, _>>();
+    let evidence_spans = evidence
+        .iter()
+        .map(|record| (record.id.as_str(), (record.start_byte, record.end_byte)))
+        .collect::<BTreeMap<_, _>>();
+    let mut python_modules = BTreeMap::<String, Vec<String>>::new();
+    for entity in entities.iter().filter(|entity| {
+        entity.kind == EntityKind::File && entity.language == Some(Language::Python)
+    }) {
+        for module in semantic_python_modules_for_path(&entity.path) {
+            python_modules
+                .entry(module)
+                .or_default()
+                .push(entity.id.clone());
+        }
+    }
+    for candidates in python_modules.values_mut() {
+        candidates.sort();
+        candidates.dedup();
+    }
+    let mut portable_python_modules = BTreeMap::<String, BTreeSet<String>>::new();
+    for module in python_modules.keys() {
+        portable_python_modules
+            .entry(module.to_lowercase())
+            .or_default()
+            .insert(module.clone());
+    }
+    let qualified_names_by_id = entities
+        .iter()
+        .map(|entity| (entity.id.as_str(), entity.qualified_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let conditional_declaration_names = bindings
+        .iter()
+        .filter(|binding| binding.kind == PythonBindingKind::ConditionalDeclaration)
+        .map(|binding| (binding.scope_id.as_str(), binding.name.as_str()))
+        .collect::<BTreeSet<_>>();
+    let conditional_qualified_names = bindings
+        .iter()
+        .filter(|binding| {
+            matches!(
+                binding.kind,
+                PythonBindingKind::ConditionalDeclaration | PythonBindingKind::ConditionalImport
+            )
+        })
+        .filter_map(|binding| {
+            qualified_names_by_id
+                .get(binding.scope_id.as_str())
+                .map(|owner| format!("{owner}.{}", binding.name))
+        })
+        .collect::<BTreeSet<_>>();
+    let declarations = entities
+        .iter()
+        .filter(|entity| {
+            entity.language == Some(Language::Python)
+                && entity.kind != EntityKind::File
+                && !entity.owner_id.as_deref().is_some_and(|owner_id| {
+                    conditional_declaration_names.contains(&(owner_id, entity.name.as_str()))
+                })
+        })
+        .collect::<Vec<_>>();
+    let import_references = references
+        .iter()
+        .filter(|reference| reference.kind == SemanticReferenceKind::ImportBinding)
+        .map(|reference| {
+            let mut reference = reference.clone();
+            if matches!(
+                &reference.resolution,
+                SemanticResolution::Unresolved { reason }
+                    if reason == PENDING_SEMANTIC_RESOLUTION_REASON
+            ) {
+                reference.resolution = resolve_python_import_binding(
+                    &reference,
+                    &declarations,
+                    &python_modules,
+                    &portable_python_modules,
+                    &conditional_qualified_names,
+                    &entities_by_id,
+                );
+            }
+            reference
+        })
+        .collect::<Vec<_>>();
+    let parent_scopes = entities
+        .iter()
+        .filter_map(|entity| {
+            entity
+                .owner_id
+                .as_ref()
+                .map(|owner| (entity.id.as_str(), owner.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for reference in references.iter_mut() {
+        if matches!(
+            &reference.resolution,
+            SemanticResolution::Unresolved { reason }
+                if reason != PENDING_SEMANTIC_RESOLUTION_REASON
+        ) {
+            continue;
+        }
+        reference.resolution = match reference.kind {
+            SemanticReferenceKind::ImportBinding => resolve_python_import_binding(
+                reference,
+                &declarations,
+                &python_modules,
+                &portable_python_modules,
+                &conditional_qualified_names,
+                &entities_by_id,
+            ),
+            SemanticReferenceKind::Call
+            | SemanticReferenceKind::Extends
+            | SemanticReferenceKind::TypeUse
+            | SemanticReferenceKind::Decorator => resolve_python_named_reference(
+                reference,
+                &declarations,
+                &import_references,
+                bindings,
+                &parent_scopes,
+                &entities_by_id,
+                &evidence_spans,
+            ),
+        };
+    }
+
+    relationships.retain(|relationship| {
+        !matches!(
+            relationship.origin,
+            RelationshipOrigin::SemanticReference { .. }
+        )
+    });
+    for reference in references.iter() {
+        let SemanticResolution::Resolved { target_entity_id } = &reference.resolution else {
+            continue;
+        };
+        let source = reference
+            .source_entity_id
+            .as_deref()
+            .unwrap_or(reference.scope_id.as_str());
+        relationships.push(Relationship {
+            id: stable_id(
+                "rel",
+                &[
+                    semantic_reference_kind_label(reference.kind),
+                    source,
+                    target_entity_id,
+                    &reference.id,
+                ],
+            ),
+            source: source.to_owned(),
+            target: target_entity_id.clone(),
+            kind: relationship_kind_for_semantic_reference(reference.kind),
+            origin: RelationshipOrigin::SemanticReference {
+                reference_id: reference.id.clone(),
+            },
+            evidence_ids: vec![reference.evidence_id.clone()],
+        });
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "module identity, portable path, and member resolution checks stay together for fail-closed auditing"
+)]
+fn resolve_python_import_binding(
+    reference: &SemanticReference,
+    declarations: &[&Entity],
+    python_modules: &BTreeMap<String, Vec<String>>,
+    portable_python_modules: &BTreeMap<String, BTreeSet<String>>,
+    conditional_qualified_names: &BTreeSet<String>,
+    entities_by_id: &BTreeMap<&str, &Entity>,
+) -> SemanticResolution {
+    if reference.name == "*" {
+        return SemanticResolution::Unresolved {
+            reason: "wildcard imports do not establish a unique binding target".to_owned(),
+        };
+    }
+    let Some(qualifier) = reference.qualifier.as_deref() else {
+        if let Some(resolution) =
+            python_module_case_guard(&reference.name, python_modules, portable_python_modules)
+        {
+            return resolution;
+        }
+        let module_targets = python_module_entity_candidates(&reference.name, python_modules);
+        return resolution_from_candidates(
+            module_targets,
+            Some(reference.name.clone()),
+            "imported Python module is outside the scanned repository",
+            "imported Python module matches multiple repository files",
+        );
+    };
+    if qualifier == "__future__" {
+        return SemanticResolution::External {
+            target: format!("{qualifier}.{}", reference.name),
+            reason: "Python future imports are compiler directives".to_owned(),
+        };
+    }
+    if qualifier.bytes().all(|byte| byte == b'.') {
+        return SemanticResolution::Unresolved {
+            reason: "dots-only imports may refer to a package attribute or a same-named submodule"
+                .to_owned(),
+        };
+    }
+    let Some(module) = normalize_python_module_name(&reference.path, qualifier) else {
+        return SemanticResolution::Unresolved {
+            reason: "relative Python import escapes the repository package root".to_owned(),
+        };
+    };
+    if let Some(resolution) =
+        python_module_case_guard(&module, python_modules, portable_python_modules)
+    {
+        return resolution;
+    }
+    let imported_qualified_name = if module.is_empty() {
+        reference.name.clone()
+    } else {
+        format!("{module}.{}", reference.name)
+    };
+    if conditional_qualified_names.iter().any(|conditional| {
+        imported_qualified_name == *conditional
+            || imported_qualified_name
+                .strip_prefix(conditional)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    }) {
+        return SemanticResolution::Unresolved {
+            reason: PYTHON_CONDITIONAL_BINDING_RESOLUTION_REASON.to_owned(),
+        };
+    }
+    let local_module_candidates = python_module_entity_candidates(&module, python_modules);
+    if let Some(resolution) = python_module_case_guard(
+        &imported_qualified_name,
+        python_modules,
+        portable_python_modules,
+    ) {
+        return resolution;
+    }
+    let imported_module_candidates =
+        python_module_entity_candidates(&imported_qualified_name, python_modules);
+    if local_module_candidates.len() > 1 {
+        let mut member_candidates = declarations
+            .iter()
+            .filter(|entity| {
+                entity.qualified_name == imported_qualified_name
+                    && local_module_candidates
+                        .iter()
+                        .any(|file_id| entity_belongs_to_file(entity, file_id, entities_by_id))
+            })
+            .map(|entity| entity.id.clone())
+            .collect::<Vec<_>>();
+        member_candidates.extend(imported_module_candidates);
+        member_candidates.sort();
+        member_candidates.dedup();
+        return if member_candidates.len() > 1 {
+            SemanticResolution::Ambiguous {
+                candidate_entity_ids: member_candidates,
+                reason: "Python qualifier and member match multiple repository declarations"
+                    .to_owned(),
+            }
+        } else {
+            SemanticResolution::Unresolved {
+                reason: "Python qualifier module has multiple repository candidates".to_owned(),
+            }
+        };
+    }
+    if local_module_candidates.is_empty() {
+        if !imported_module_candidates.is_empty() {
+            return resolution_from_candidates(
+                imported_module_candidates,
+                None,
+                "",
+                "imported Python module matches multiple repository files",
+            );
+        }
+        return if qualifier.starts_with('.')
+            || python_module_has_repository_prefix(&module, portable_python_modules)
+        {
+            SemanticResolution::Unresolved {
+                reason: "Python qualifier is not a uniquely scanned importable module".to_owned(),
+            }
+        } else {
+            SemanticResolution::External {
+                target: imported_qualified_name,
+                reason: "absolute Python qualifier module is outside the scanned repository"
+                    .to_owned(),
+            }
+        };
+    }
+    let local_module_id = &local_module_candidates[0];
+    let mut candidates = declarations
+        .iter()
+        .filter(|entity| {
+            entity.qualified_name == imported_qualified_name
+                && entity_belongs_to_file(entity, local_module_id, entities_by_id)
+        })
+        .map(|entity| entity.id.clone())
+        .collect::<Vec<_>>();
+    candidates.extend(imported_module_candidates);
+    if candidates.is_empty() {
+        return SemanticResolution::Unresolved {
+            reason: "scanned Python module does not expose this name as a static declaration"
+                .to_owned(),
+        };
+    }
+    resolution_from_candidates(
+        candidates,
+        (!qualifier.starts_with('.')).then_some(imported_qualified_name),
+        "imported Python symbol is outside the scanned repository or not exported as a declaration",
+        "imported Python symbol matches multiple repository declarations",
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "fail-closed lexical and import resolution branches are kept together for auditability"
+)]
+fn resolve_python_named_reference(
+    reference: &SemanticReference,
+    declarations: &[&Entity],
+    import_references: &[SemanticReference],
+    bindings: &[PythonBinding],
+    parent_scopes: &BTreeMap<&str, &str>,
+    entities_by_id: &BTreeMap<&str, &Entity>,
+    evidence_spans: &BTreeMap<&str, (u64, u64)>,
+) -> SemanticResolution {
+    if reference.name.contains('.') {
+        return SemanticResolution::Unresolved {
+            reason: "member or qualified access may use dynamic Python dispatch".to_owned(),
+        };
+    }
+    let reference_start = evidence_spans
+        .get(reference.evidence_id.as_str())
+        .map(|(start, _)| *start);
+    let reference_scope_kind = entities_by_id
+        .get(reference.scope_id.as_str())
+        .map(|entity| entity.kind);
+    let reference_is_immediate = matches!(
+        reference_scope_kind,
+        Some(EntityKind::File | EntityKind::Class)
+    );
+    let mut scope = Some(reference.scope_id.as_str());
+    while let Some(scope_id) = scope {
+        let lookup_is_ordered = reference_is_immediate
+            || scope_id == reference.scope_id
+                && matches!(
+                    reference_scope_kind,
+                    Some(EntityKind::Function | EntityKind::Method)
+                );
+        let scope_bindings = bindings
+            .iter()
+            .filter(|binding| {
+                binding.scope_id == scope_id
+                    && binding.name == reference.name
+                    && (binding.kind != PythonBindingKind::Local
+                        || !reference_is_immediate
+                        || reference_start.is_some_and(|start| binding.visible_after_byte <= start))
+            })
+            .collect::<Vec<_>>();
+        let has_scope_redirect = scope_bindings.iter().any(|binding| {
+            matches!(
+                binding.kind,
+                PythonBindingKind::Global | PythonBindingKind::Nonlocal
+            )
+        });
+        let has_redirect_conflict = scope_bindings.iter().any(|binding| {
+            matches!(
+                binding.kind,
+                PythonBindingKind::Local
+                    | PythonBindingKind::Declaration
+                    | PythonBindingKind::Import
+                    | PythonBindingKind::ConditionalDeclaration
+                    | PythonBindingKind::ConditionalImport
+                    | PythonBindingKind::Delete
+            )
+        });
+        if has_scope_redirect && has_redirect_conflict {
+            return SemanticResolution::Unresolved {
+                reason: "global or nonlocal name is rebound in the same scope".to_owned(),
+            };
+        }
+        if let Some(binding) = scope_bindings
+            .iter()
+            .find(|binding| binding.kind == PythonBindingKind::Global)
+        {
+            let _ = binding;
+            let root = root_file_scope(scope_id, parent_scopes, entities_by_id);
+            if root == Some(scope_id) {
+                // `global` at module scope is redundant and does not alter lookup.
+            } else {
+                scope = root;
+                continue;
+            }
+        }
+        if scope_bindings
+            .iter()
+            .any(|binding| binding.kind == PythonBindingKind::Nonlocal)
+        {
+            scope = next_python_resolution_scope(scope_id, parent_scopes, entities_by_id);
+            continue;
+        }
+        if scope_bindings.iter().any(|binding| {
+            matches!(
+                binding.kind,
+                PythonBindingKind::ConditionalDeclaration | PythonBindingKind::ConditionalImport
+            )
+        }) {
+            return SemanticResolution::Unresolved {
+                reason: PYTHON_CONDITIONAL_BINDING_RESOLUTION_REASON.to_owned(),
+            };
+        }
+        if scope_bindings
+            .iter()
+            .any(|binding| binding.kind == PythonBindingKind::Delete)
+        {
+            return SemanticResolution::Unresolved {
+                reason: "name may have been removed by a Python del statement in this scope"
+                    .to_owned(),
+            };
+        }
+        if scope_bindings
+            .iter()
+            .any(|binding| binding.kind == PythonBindingKind::Local)
+        {
+            return SemanticResolution::Unresolved {
+                reason: "name is shadowed by a parameter or assignment in the lexical scope"
+                    .to_owned(),
+            };
+        }
+
+        let is_visible = |evidence_id: &str| {
+            !lookup_is_ordered
+                || evidence_spans
+                    .get(evidence_id)
+                    .zip(reference_start)
+                    .is_some_and(|((_, candidate_end), reference_start)| {
+                        *candidate_end <= reference_start
+                    })
+        };
+        let raw_declarations = declarations
+            .iter()
+            .filter(|entity| {
+                entity.owner_id.as_deref() == Some(scope_id)
+                    && entity.name == reference.name
+                    && is_visible(&entity.evidence_id)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let mut candidates = raw_declarations
+            .iter()
+            .filter(|entity| semantic_target_kind_allowed(reference.kind, entity.kind))
+            .map(|entity| entity.id.clone())
+            .collect::<Vec<_>>();
+        let matching_imports = import_references
+            .iter()
+            .filter(|import| {
+                import.scope_id == scope_id
+                    && import.binding_name.as_deref() == Some(reference.name.as_str())
+                    && is_visible(&import.evidence_id)
+            })
+            .collect::<Vec<_>>();
+        let wildcard_taint = import_references.iter().any(|import| {
+            import.scope_id == scope_id
+                && import.binding_name.as_deref() == Some("*")
+                && is_visible(&import.evidence_id)
+        });
+        if wildcard_taint {
+            return SemanticResolution::Unresolved {
+                reason: "wildcard import may bind this bare name in the lexical scope".to_owned(),
+            };
+        }
+        if raw_declarations.is_empty()
+            && matching_imports.is_empty()
+            && lookup_is_ordered
+            && scope_bindings.iter().any(|binding| {
+                matches!(
+                    binding.kind,
+                    PythonBindingKind::Declaration | PythonBindingKind::Import
+                ) && reference_start.is_none_or(|start| binding.visible_after_byte > start)
+            })
+        {
+            return SemanticResolution::Unresolved {
+                reason: "name is bound later in the currently executing Python scope".to_owned(),
+            };
+        }
+        candidates.sort();
+        candidates.dedup();
+        if !raw_declarations.is_empty() && !matching_imports.is_empty() {
+            return SemanticResolution::Unresolved {
+                reason: "local declaration conflicts with an import binding of the same name"
+                    .to_owned(),
+            };
+        }
+        if !raw_declarations.is_empty() {
+            if candidates.is_empty() {
+                return SemanticResolution::Unresolved {
+                    reason: "local declaration is incompatible with this semantic reference kind"
+                        .to_owned(),
+                };
+            }
+            return resolution_from_candidates(
+                candidates,
+                None,
+                "",
+                "name resolves to multiple lexical or imported declarations",
+            );
+        }
+        if matching_imports.len() == 1 {
+            return match &matching_imports[0].resolution {
+                SemanticResolution::Resolved { target_entity_id }
+                    if entities_by_id
+                        .get(target_entity_id.as_str())
+                        .is_some_and(|entity| {
+                            semantic_target_kind_allowed(reference.kind, entity.kind)
+                        }) =>
+                {
+                    SemanticResolution::Resolved {
+                        target_entity_id: target_entity_id.clone(),
+                    }
+                }
+                SemanticResolution::External { target, reason } => SemanticResolution::External {
+                    target: target.clone(),
+                    reason: reason.clone(),
+                },
+                SemanticResolution::Resolved { .. } => SemanticResolution::Unresolved {
+                    reason: "import binding target is not valid for this semantic reference kind"
+                        .to_owned(),
+                },
+                SemanticResolution::Ambiguous { .. } => SemanticResolution::Unresolved {
+                    reason: "ambiguous import binding cannot establish a unique name target"
+                        .to_owned(),
+                },
+                SemanticResolution::Unresolved { reason } => SemanticResolution::Unresolved {
+                    reason: reason.clone(),
+                },
+            };
+        }
+        if matching_imports.len() > 1 {
+            return SemanticResolution::Unresolved {
+                reason: "multiple import bindings with this name prevent unique resolution"
+                    .to_owned(),
+            };
+        }
+        scope = next_python_resolution_scope(scope_id, parent_scopes, entities_by_id);
+    }
+    SemanticResolution::Unresolved {
+        reason: "name is not a uniquely known lexical declaration or import binding".to_owned(),
+    }
+}
+
+fn next_python_resolution_scope<'a>(
+    scope_id: &'a str,
+    parent_scopes: &BTreeMap<&'a str, &'a str>,
+    entities_by_id: &BTreeMap<&str, &Entity>,
+) -> Option<&'a str> {
+    let mut parent = parent_scopes.get(scope_id).copied()?;
+    let current = entities_by_id.get(scope_id)?;
+    if current.kind == EntityKind::Class
+        || matches!(current.kind, EntityKind::Function | EntityKind::Method)
+            && entities_by_id
+                .get(parent)
+                .is_some_and(|entity| entity.kind == EntityKind::Class)
+    {
+        while entities_by_id
+            .get(parent)
+            .is_some_and(|entity| entity.kind == EntityKind::Class)
+        {
+            parent = parent_scopes.get(parent).copied()?;
+        }
+    }
+    Some(parent)
+}
+
+fn semantic_target_kind_allowed(
+    reference_kind: SemanticReferenceKind,
+    entity_kind: EntityKind,
+) -> bool {
+    match reference_kind {
+        SemanticReferenceKind::ImportBinding => true,
+        SemanticReferenceKind::Call | SemanticReferenceKind::Decorator => matches!(
+            entity_kind,
+            EntityKind::Function | EntityKind::Method | EntityKind::Class
+        ),
+        SemanticReferenceKind::Extends => entity_kind == EntityKind::Class,
+        SemanticReferenceKind::TypeUse => matches!(
+            entity_kind,
+            EntityKind::Class | EntityKind::Interface | EntityKind::Type | EntityKind::Enum
+        ),
+    }
+}
+
+fn root_file_scope<'a>(
+    scope_id: &'a str,
+    parent_scopes: &BTreeMap<&'a str, &'a str>,
+    entities_by_id: &BTreeMap<&str, &Entity>,
+) -> Option<&'a str> {
+    let mut current = scope_id;
+    loop {
+        if entities_by_id
+            .get(current)
+            .is_some_and(|entity| entity.kind == EntityKind::File)
+        {
+            return Some(current);
+        }
+        current = parent_scopes.get(current).copied()?;
+    }
+}
+
+fn python_module_entity_candidates(
+    module: &str,
+    python_modules: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    python_modules.get(module).cloned().unwrap_or_default()
+}
+
+fn semantic_python_modules_for_path(path: &str) -> BTreeSet<String> {
+    let mut components = path.split('/').collect::<Vec<_>>();
+    let Some(filename) = components.pop() else {
+        return BTreeSet::new();
+    };
+    let Some(stem) = filename
+        .get(filename.len().saturating_sub(3)..)
+        .filter(|suffix| suffix.eq_ignore_ascii_case(".py"))
+        .and_then(|_| filename.get(..filename.len().saturating_sub(3)))
+    else {
+        return BTreeSet::new();
+    };
+    if !stem.eq_ignore_ascii_case("__init__") {
+        components.push(stem);
+    }
+    if components
+        .iter()
+        .any(|component| component.is_empty() || component.contains('.'))
+    {
+        return BTreeSet::new();
+    }
+    let canonical = components.join(".");
+    let mut modules = BTreeSet::from([canonical.clone()]);
+    if canonical
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("src."))
+        && canonical.len() > 4
+    {
+        modules.insert(canonical[4..].to_owned());
+    }
+    modules
+}
+
+fn python_module_case_guard(
+    module: &str,
+    python_modules: &BTreeMap<String, Vec<String>>,
+    portable_python_modules: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<SemanticResolution> {
+    let portable_matches = portable_python_modules.get(&module.to_lowercase())?;
+    if !python_modules.contains_key(module) {
+        return Some(SemanticResolution::Unresolved {
+            reason: "Python module differs from a scanned repository path only by case".to_owned(),
+        });
+    }
+    (portable_matches.len() > 1).then(|| SemanticResolution::Unresolved {
+        reason: "Python module name has a portable case collision in the repository".to_owned(),
+    })
+}
+
+fn python_module_has_repository_prefix(
+    module: &str,
+    portable_python_modules: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let mut prefix = module;
+    loop {
+        if portable_python_modules.contains_key(&prefix.to_lowercase()) {
+            return true;
+        }
+        let Some((parent, _)) = prefix.rsplit_once('.') else {
+            return false;
+        };
+        prefix = parent;
+    }
+}
+
+fn entity_belongs_to_file(
+    entity: &Entity,
+    file_id: &str,
+    entities_by_id: &BTreeMap<&str, &Entity>,
+) -> bool {
+    let mut owner = entity.owner_id.as_deref();
+    while let Some(owner_id) = owner {
+        if owner_id == file_id {
+            return true;
+        }
+        owner = entities_by_id
+            .get(owner_id)
+            .and_then(|owner_entity| owner_entity.owner_id.as_deref());
+    }
+    false
+}
+
+fn normalize_python_module_name(importing_path: &str, specifier: &str) -> Option<String> {
+    let leading_dots = specifier.bytes().take_while(|byte| *byte == b'.').count();
+    if leading_dots == 0 {
+        return Some(specifier.to_owned());
+    }
+    let mut components = importing_path.split('/').collect::<Vec<_>>();
+    let filename = components.pop()?;
+    if components
+        .first()
+        .is_some_and(|component| component.eq_ignore_ascii_case("src"))
+    {
+        components.remove(0);
+    }
+    if components.is_empty() && !filename.eq_ignore_ascii_case("__init__.py") {
+        return None;
+    }
+    let levels_up = leading_dots.saturating_sub(1);
+    if levels_up > 0 && levels_up >= components.len() {
+        return None;
+    }
+    components.truncate(components.len() - levels_up);
+    let remainder = &specifier[leading_dots..];
+    if !remainder.is_empty() {
+        components.extend(remainder.split('.'));
+    }
+    Some(components.join("."))
+}
+
+fn resolution_from_candidates(
+    mut candidates: Vec<String>,
+    external: Option<String>,
+    external_reason: &str,
+    ambiguous_reason: &str,
+) -> SemanticResolution {
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [target] => SemanticResolution::Resolved {
+            target_entity_id: target.clone(),
+        },
+        [] => external.map_or_else(
+            || SemanticResolution::Unresolved {
+                reason: external_reason.to_owned(),
+            },
+            |target| SemanticResolution::External {
+                target,
+                reason: external_reason.to_owned(),
+            },
+        ),
+        _ => SemanticResolution::Ambiguous {
+            candidate_entity_ids: candidates,
+            reason: ambiguous_reason.to_owned(),
+        },
+    }
 }
 
 fn resolve_relative_javascript_target<'a>(
@@ -967,6 +1817,8 @@ fn excluded_extraction(
                 reason: reason.into(),
             },
         }],
+        semantic_references: vec![],
+        python_bindings: vec![],
     }
 }
 
@@ -1000,6 +1852,8 @@ fn unresolved_extraction(
                 reason: Some(reason.into()),
             },
         }],
+        semantic_references: vec![],
+        python_bindings: vec![],
     }
 }
 
@@ -1026,10 +1880,17 @@ fn parsed_extraction(
     let file_entity_id = stable_id("entity", &["file", &path]);
     let concept_id = concept_id_for_path(&path);
     let mut evidence = vec![file_evidence.clone()];
+    let file_qualified_name = source_qualified_file_name(&path, language);
     let mut entities = vec![Entity {
         id: file_entity_id.clone(),
         kind: EntityKind::File,
         name: path.rsplit('/').next().unwrap_or(&path).to_owned(),
+        qualified_name: if file_qualified_name.is_empty() {
+            "__root__".to_owned()
+        } else {
+            file_qualified_name
+        },
+        owner_id: None,
         path: path.clone(),
         language: Some(language),
         evidence_id: file_evidence.id.clone(),
@@ -1039,6 +1900,8 @@ fn parsed_extraction(
             symbols: parse_markdown(source),
             imports: Vec::new(),
             docstring: None,
+            semantic_references: Vec::new(),
+            python_bindings: Vec::new(),
         },
         Language::JavaScript
         | Language::TypeScript
@@ -1046,6 +1909,8 @@ fn parsed_extraction(
         | Language::Python
         | Language::Rust => parse_tree_sitter(language, &path, source)?,
     };
+    let parsed_semantic_references = parsed.semantic_references.clone();
+    let parsed_python_bindings = parsed.python_bindings.clone();
 
     let mut relationships = Vec::new();
     let mut claims = Vec::new();
@@ -1059,6 +1924,24 @@ fn parsed_extraction(
         },
     }];
 
+    let symbol_ids = parsed
+        .symbols
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.start_byte,
+                stable_id(
+                    "entity",
+                    &[
+                        entity_kind_label(symbol.kind),
+                        &path,
+                        &symbol.name,
+                        &symbol.start_byte.to_string(),
+                    ],
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for symbol in parsed.symbols {
         let symbol_evidence = make_evidence(
             &path,
@@ -1069,30 +1952,30 @@ fn parsed_extraction(
             symbol.end_line,
             Some(symbol.name.clone()),
         );
-        let entity_id = stable_id(
-            "entity",
-            &[
-                entity_kind_label(symbol.kind),
-                &path,
-                &symbol.name,
-                &symbol.start_byte.to_string(),
-            ],
-        );
-        let relationship_id = stable_id("rel", &["contains", &file_entity_id, &entity_id]);
+        let entity_id = symbol_ids[&symbol.start_byte].clone();
+        let owner_id = symbol
+            .owner_start_byte
+            .and_then(|start| symbol_ids.get(&start))
+            .unwrap_or(&file_entity_id)
+            .clone();
+        let relationship_id = stable_id("rel", &["contains", &owner_id, &entity_id]);
         let claim_id = stable_id("claim", &["declares", &entity_id]);
         entities.push(Entity {
             id: entity_id.clone(),
             kind: symbol.kind,
             name: symbol.name.clone(),
+            qualified_name: symbol.qualified_name.clone(),
+            owner_id: Some(owner_id.clone()),
             path: path.clone(),
             language: Some(language),
             evidence_id: symbol_evidence.id.clone(),
         });
         relationships.push(Relationship {
             id: relationship_id,
-            source: file_entity_id.clone(),
+            source: owner_id,
             target: entity_id.clone(),
             kind: RelationshipKind::Contains,
+            origin: RelationshipOrigin::ObservedSyntax,
             evidence_ids: vec![symbol_evidence.id.clone()],
         });
         claims.push(Claim {
@@ -1215,6 +2098,7 @@ fn parsed_extraction(
             source: file_entity_id.clone(),
             target: external_id,
             kind: RelationshipKind::Imports,
+            origin: RelationshipOrigin::ObservedSyntax,
             evidence_ids: vec![import_evidence.id.clone()],
         });
         coverage.push(CoverageItem {
@@ -1237,6 +2121,74 @@ fn parsed_extraction(
         evidence.push(import_evidence);
     }
 
+    let mut semantic_references = Vec::new();
+    let mut python_bindings = Vec::new();
+    if language == Language::Python {
+        for reference in parsed_semantic_references {
+            let initial_resolution = reference.forced_unresolved_reason.map_or_else(
+                || SemanticResolution::Unresolved {
+                    reason: PENDING_SEMANTIC_RESOLUTION_REASON.to_owned(),
+                },
+                |reason| SemanticResolution::Unresolved {
+                    reason: reason.to_owned(),
+                },
+            );
+            let reference_evidence = make_evidence(
+                &path,
+                &content_hash,
+                reference.span.start_byte,
+                reference.span.end_byte,
+                reference.span.start_line,
+                reference.span.end_line,
+                None,
+            );
+            let scope_id = reference
+                .scope_start_byte
+                .and_then(|start| symbol_ids.get(&start))
+                .unwrap_or(&file_entity_id)
+                .clone();
+            let source_entity_id = reference
+                .source_start_byte
+                .and_then(|start| symbol_ids.get(&start))
+                .cloned();
+            let id = stable_id(
+                "ref",
+                &[
+                    semantic_reference_kind_label(reference.kind),
+                    &path,
+                    &reference.name,
+                    &reference.span.start_byte.to_string(),
+                    reference.binding_name.as_deref().unwrap_or(""),
+                ],
+            );
+            semantic_references.push(SemanticReference {
+                id,
+                kind: reference.kind,
+                path: path.clone(),
+                scope_id,
+                source_entity_id,
+                name: reference.name,
+                qualifier: reference.qualifier,
+                binding_name: reference.binding_name,
+                evidence_id: reference_evidence.id.clone(),
+                resolution: initial_resolution,
+            });
+            evidence.push(reference_evidence);
+        }
+        for binding in parsed_python_bindings {
+            python_bindings.push(PythonBinding {
+                name: binding.name,
+                scope_id: binding
+                    .scope_start_byte
+                    .and_then(|start| symbol_ids.get(&start))
+                    .unwrap_or(&file_entity_id)
+                    .clone(),
+                kind: binding.kind,
+                visible_after_byte: u64::try_from(binding.visible_after_byte).unwrap_or(u64::MAX),
+            });
+        }
+    }
+
     Ok(FileExtraction {
         file: FileRecord {
             path,
@@ -1252,9 +2204,15 @@ fn parsed_extraction(
         relationships,
         claims,
         coverage,
+        semantic_references,
+        python_bindings,
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "parser setup, normalization and deterministic sort form one extraction transaction"
+)]
 fn parse_tree_sitter(
     language: Language,
     path: &str,
@@ -1283,6 +2241,8 @@ fn parse_tree_sitter(
             symbols: Vec::new(),
             imports: Vec::new(),
             docstring: None,
+            semantic_references: Vec::new(),
+            python_bindings: Vec::new(),
         });
     };
     let file_docstring = (language == Language::Python)
@@ -1294,6 +2254,7 @@ fn parse_tree_sitter(
         tree.root_node(),
         source,
         language,
+        path,
         &mut symbols,
         &mut imports,
     );
@@ -1315,10 +2276,77 @@ fn parse_tree_sitter(
     imports.dedup_by(|left, right| {
         left.start_byte == right.start_byte && left.specifier == right.specifier
     });
+    let (mut semantic_references, mut python_bindings) = if language == Language::Python {
+        extract_python_semantics(tree.root_node(), source)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    if language == Language::Python {
+        for symbol in &symbols {
+            python_bindings.push(ParsedPythonBinding {
+                name: symbol.name.clone(),
+                scope_start_byte: symbol.owner_start_byte,
+                kind: if symbol.conditional_binding {
+                    PythonBindingKind::ConditionalDeclaration
+                } else {
+                    PythonBindingKind::Declaration
+                },
+                visible_after_byte: symbol.end_byte,
+            });
+        }
+        for import in &imports {
+            for binding in &import.bindings {
+                python_bindings.push(ParsedPythonBinding {
+                    name: binding.binding_name.clone(),
+                    scope_start_byte: import.scope_start_byte,
+                    kind: if import.conditional_binding {
+                        PythonBindingKind::ConditionalImport
+                    } else {
+                        PythonBindingKind::Import
+                    },
+                    visible_after_byte: import.end_byte,
+                });
+                semantic_references.push(ParsedSemanticReference {
+                    kind: SemanticReferenceKind::ImportBinding,
+                    name: binding.imported_name.clone(),
+                    qualifier: binding.qualifier.clone(),
+                    binding_name: Some(binding.binding_name.clone()),
+                    span: ParsedSpan {
+                        start_byte: import.start_byte,
+                        end_byte: import.end_byte,
+                        start_line: import.start_line,
+                        end_line: import.end_line,
+                    },
+                    scope_start_byte: import.scope_start_byte,
+                    source_start_byte: import.scope_start_byte,
+                    forced_unresolved_reason: import
+                        .conditional_binding
+                        .then_some(PYTHON_CONDITIONAL_BINDING_RESOLUTION_REASON),
+                });
+            }
+        }
+        normalize_python_bindings(&mut python_bindings);
+    }
+    semantic_references.sort_by(|left, right| {
+        left.span
+            .start_byte
+            .cmp(&right.span.start_byte)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    semantic_references.dedup_by(|left, right| {
+        left.kind == right.kind
+            && left.name == right.name
+            && left.binding_name == right.binding_name
+            && left.span.start_byte == right.span.start_byte
+            && left.span.end_byte == right.span.end_byte
+    });
     Ok(ParsedFile {
         symbols,
         imports,
         docstring: file_docstring,
+        semantic_references,
+        python_bindings,
     })
 }
 
@@ -1326,6 +2354,7 @@ fn walk_syntax(
     node: Node<'_>,
     source: &str,
     language: Language,
+    path: &str,
     symbols: &mut Vec<ParsedSymbol>,
     imports: &mut Vec<ParsedImport>,
 ) {
@@ -1346,6 +2375,10 @@ fn walk_syntax(
                 docstring: (language == Language::Python)
                     .then(|| python_docstring_span(node, source))
                     .flatten(),
+                owner_start_byte: lexical_owner_start_byte(node, language),
+                qualified_name: qualified_symbol_name(path, language, node, source, name),
+                conditional_binding: language == Language::Python
+                    && python_binding_is_conditional(node),
             });
         }
     }
@@ -1358,7 +2391,7 @@ fn walk_syntax(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_syntax(child, source, language, symbols, imports);
+        walk_syntax(child, source, language, path, symbols, imports);
     }
 }
 
@@ -1427,6 +2460,77 @@ fn is_python_method(node: Node<'_>) -> bool {
         .is_some_and(|parent| parent.kind() == "class_definition")
 }
 
+fn lexical_owner_start_byte(node: Node<'_>, language: Language) -> Option<usize> {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if entity_kind_for_node(current, language).is_some() {
+            return Some(declaration_span_node(current, language).start_byte());
+        }
+        ancestor = current.parent();
+    }
+    None
+}
+
+fn qualified_symbol_name(
+    path: &str,
+    language: Language,
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+) -> String {
+    let mut owners = Vec::new();
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if entity_kind_for_node(current, language).is_some()
+            && let Some(name_node) = name_node(current, language)
+            && let Ok(owner_name) = name_node.utf8_text(source.as_bytes())
+            && !owner_name.trim().is_empty()
+        {
+            owners.push(owner_name.trim().to_owned());
+        }
+        ancestor = current.parent();
+    }
+    owners.reverse();
+    owners.push(name.to_owned());
+    let file_name = source_qualified_file_name(path, language);
+    if language == Language::Python {
+        std::iter::once(file_name)
+            .chain(owners)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        format!("{file_name}::{}", owners.join("::"))
+    }
+}
+
+fn source_qualified_file_name(path: &str, language: Language) -> String {
+    if language != Language::Python {
+        return path.to_owned();
+    }
+    let without_extension = path
+        .get(path.len().saturating_sub(3)..)
+        .filter(|suffix| suffix.eq_ignore_ascii_case(".py"))
+        .and_then(|_| path.get(..path.len().saturating_sub(3)))
+        .unwrap_or(path);
+    let mut module = without_extension.replace('/', ".");
+    if module.eq_ignore_ascii_case("__init__") {
+        module.clear();
+    } else if module
+        .rsplit_once('.')
+        .is_some_and(|(_, filename)| filename.eq_ignore_ascii_case("__init__"))
+    {
+        module.truncate(module.rfind('.').unwrap_or_default());
+    }
+    if module
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("src."))
+    {
+        module.drain(..4);
+    }
+    module
+}
+
 fn python_docstring_span(owner: Node<'_>, source: &str) -> Option<ParsedSpan> {
     let body = if owner.kind() == "module" {
         owner
@@ -1492,20 +2596,517 @@ fn node_contains_kind(node: Node<'_>, kind: &str) -> bool {
         .any(|child| node_contains_kind(child, kind))
 }
 
+fn extract_python_semantics(
+    root: Node<'_>,
+    source: &str,
+) -> (Vec<ParsedSemanticReference>, Vec<ParsedPythonBinding>) {
+    let mut references = Vec::new();
+    let mut bindings = Vec::new();
+    walk_python_semantics(root, source, &mut references, &mut bindings);
+    normalize_python_bindings(&mut bindings);
+    (references, bindings)
+}
+
+fn normalize_python_bindings(bindings: &mut Vec<ParsedPythonBinding>) {
+    bindings.sort_by(|left, right| {
+        left.scope_start_byte
+            .cmp(&right.scope_start_byte)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| {
+                python_binding_kind_order(left.kind).cmp(&python_binding_kind_order(right.kind))
+            })
+            .then_with(|| left.visible_after_byte.cmp(&right.visible_after_byte))
+    });
+    bindings.dedup_by(|left, right| {
+        left.scope_start_byte == right.scope_start_byte
+            && left.name == right.name
+            && left.kind == right.kind
+            && left.visible_after_byte == right.visible_after_byte
+    });
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the Python semantic syntax inventory is intentionally explicit and fail-closed"
+)]
+fn walk_python_semantics(
+    node: Node<'_>,
+    source: &str,
+    references: &mut Vec<ParsedSemanticReference>,
+    bindings: &mut Vec<ParsedPythonBinding>,
+) {
+    match node.kind() {
+        "call" => {
+            if let Some(function) = node.child_by_field_name("function") {
+                let (scope_start, source_start) = python_call_context(node);
+                append_python_named_reference(
+                    function,
+                    source,
+                    SemanticReferenceKind::Call,
+                    scope_start,
+                    source_start,
+                    references,
+                );
+            }
+        }
+        "class_definition" => {
+            if let Some(superclasses) = node.child_by_field_name("superclasses") {
+                let source_start = Some(declaration_span_node(node, Language::Python).start_byte());
+                let scope_start = lexical_owner_start_byte(node, Language::Python);
+                let mut cursor = superclasses.walk();
+                for base in superclasses.named_children(&mut cursor) {
+                    if base.kind() != "keyword_argument" {
+                        append_python_named_reference(
+                            base,
+                            source,
+                            SemanticReferenceKind::Extends,
+                            scope_start,
+                            source_start,
+                            references,
+                        );
+                    }
+                }
+            }
+        }
+        "decorator" => {
+            if let Some(target) = python_decorated_target(node) {
+                let expression = node.named_child(0);
+                if let Some(expression) = expression {
+                    let decorated = decorator_callable(expression);
+                    append_python_named_reference(
+                        decorated,
+                        source,
+                        SemanticReferenceKind::Decorator,
+                        lexical_owner_start_byte(target, Language::Python),
+                        Some(declaration_span_node(target, Language::Python).start_byte()),
+                        references,
+                    );
+                }
+            }
+        }
+        "function_definition" => {
+            let source_start = Some(declaration_span_node(node, Language::Python).start_byte());
+            let annotation_scope = lexical_owner_start_byte(node, Language::Python);
+            if let Some(return_type) = node.child_by_field_name("return_type") {
+                append_python_type_references(
+                    return_type,
+                    source,
+                    annotation_scope,
+                    source_start,
+                    references,
+                );
+            }
+        }
+        "typed_parameter" | "typed_default_parameter" => {
+            if let Some(annotation) = node.child_by_field_name("type") {
+                let function = nearest_python_declaration(node);
+                let source_start = function
+                    .map(|owner| declaration_span_node(owner, Language::Python).start_byte());
+                let annotation_scope =
+                    function.and_then(|owner| lexical_owner_start_byte(owner, Language::Python));
+                append_python_type_references(
+                    annotation,
+                    source,
+                    annotation_scope,
+                    source_start,
+                    references,
+                );
+            }
+        }
+        "assignment" => {
+            if let Some(annotation) = node.child_by_field_name("type") {
+                append_python_type_references(
+                    annotation,
+                    source,
+                    nearest_python_scope_start(node),
+                    nearest_python_scope_start(node),
+                    references,
+                );
+            }
+            if let Some(left) = node.child_by_field_name("left") {
+                append_python_local_bindings(
+                    left,
+                    source,
+                    nearest_python_scope_start(node),
+                    node.end_byte(),
+                    bindings,
+                );
+            }
+        }
+        "for_statement" | "for_in_clause" => {
+            if !python_comprehension_ancestor(node)
+                && let Some(left) = node.child_by_field_name("left")
+            {
+                append_python_local_bindings(
+                    left,
+                    source,
+                    nearest_python_scope_start(node),
+                    left.end_byte(),
+                    bindings,
+                );
+            }
+        }
+        "except_clause" => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                append_python_local_bindings(
+                    alias,
+                    source,
+                    nearest_python_scope_start(node),
+                    alias.end_byte(),
+                    bindings,
+                );
+            }
+        }
+        "with_item" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if Some(child) != node.child_by_field_name("value") {
+                    append_python_local_bindings(
+                        child,
+                        source,
+                        nearest_python_scope_start(node),
+                        child.end_byte(),
+                        bindings,
+                    );
+                }
+            }
+        }
+        "case_clause" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "case_pattern" {
+                    append_python_local_bindings(
+                        child,
+                        source,
+                        nearest_python_scope_start(node),
+                        child.end_byte(),
+                        bindings,
+                    );
+                }
+            }
+        }
+        "augmented_assignment" | "named_expression" => {
+            if let Some(left) = node
+                .child_by_field_name("left")
+                .or_else(|| node.child_by_field_name("name"))
+            {
+                append_python_local_bindings(
+                    left,
+                    source,
+                    nearest_python_scope_start(node),
+                    node.end_byte(),
+                    bindings,
+                );
+            }
+        }
+        "delete_statement" => {
+            let mut cursor = node.walk();
+            for target in node.named_children(&mut cursor) {
+                append_python_bindings(
+                    target,
+                    source,
+                    nearest_python_scope_start(node),
+                    PythonBindingKind::Delete,
+                    node.end_byte(),
+                    bindings,
+                );
+            }
+        }
+        "parameters" => {
+            let scope_start = node
+                .parent()
+                .filter(|parent| parent.kind() == "function_definition")
+                .map(|function| declaration_span_node(function, Language::Python).start_byte());
+            let mut cursor = node.walk();
+            for parameter in node.named_children(&mut cursor) {
+                if let Some(name) = python_parameter_name_node(parameter) {
+                    append_python_local_bindings(
+                        name,
+                        source,
+                        scope_start,
+                        name.end_byte(),
+                        bindings,
+                    );
+                }
+            }
+        }
+        "global_statement" | "nonlocal_statement" => {
+            let kind = if node.kind() == "global_statement" {
+                PythonBindingKind::Global
+            } else {
+                PythonBindingKind::Nonlocal
+            };
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "identifier"
+                    && let Ok(name) = child.utf8_text(source.as_bytes())
+                {
+                    bindings.push(ParsedPythonBinding {
+                        name: name.to_owned(),
+                        scope_start_byte: nearest_python_scope_start(node),
+                        kind,
+                        visible_after_byte: node.end_byte(),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if node.kind() == "lambda" {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_python_semantics(child, source, references, bindings);
+    }
+}
+
+fn append_python_type_references(
+    annotation: Node<'_>,
+    source: &str,
+    scope_start: Option<usize>,
+    source_start: Option<usize>,
+    references: &mut Vec<ParsedSemanticReference>,
+) {
+    if matches!(
+        annotation.kind(),
+        "identifier" | "dotted_name" | "attribute"
+    ) {
+        append_python_named_reference(
+            annotation,
+            source,
+            SemanticReferenceKind::TypeUse,
+            scope_start,
+            source_start,
+            references,
+        );
+        return;
+    }
+    let mut cursor = annotation.walk();
+    for child in annotation.named_children(&mut cursor) {
+        append_python_type_references(child, source, scope_start, source_start, references);
+    }
+}
+
+fn append_python_named_reference(
+    node: Node<'_>,
+    source: &str,
+    kind: SemanticReferenceKind,
+    scope_start_byte: Option<usize>,
+    source_start_byte: Option<usize>,
+    references: &mut Vec<ParsedSemanticReference>,
+) {
+    let Ok(name) = node.utf8_text(source.as_bytes()) else {
+        return;
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    references.push(ParsedSemanticReference {
+        kind,
+        name: name.to_owned(),
+        qualifier: None,
+        binding_name: None,
+        span: parsed_span(node),
+        scope_start_byte,
+        source_start_byte,
+        forced_unresolved_reason: python_comprehension_ancestor(node)
+            .then_some(PYTHON_COMPREHENSION_RESOLUTION_REASON),
+    });
+}
+
+fn python_comprehension_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "list_comprehension"
+                | "set_comprehension"
+                | "dictionary_comprehension"
+                | "generator_expression"
+        ) {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn python_binding_is_conditional(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "module" | "function_definition" | "class_definition"
+        ) {
+            return false;
+        }
+        if matches!(
+            parent.kind(),
+            "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "try_statement"
+                | "with_statement"
+                | "match_statement"
+                | "case_clause"
+        ) {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn append_python_local_bindings(
+    node: Node<'_>,
+    source: &str,
+    scope_start_byte: Option<usize>,
+    visible_after_byte: usize,
+    bindings: &mut Vec<ParsedPythonBinding>,
+) {
+    append_python_bindings(
+        node,
+        source,
+        scope_start_byte,
+        PythonBindingKind::Local,
+        visible_after_byte,
+        bindings,
+    );
+}
+
+fn append_python_bindings(
+    node: Node<'_>,
+    source: &str,
+    scope_start_byte: Option<usize>,
+    kind: PythonBindingKind,
+    visible_after_byte: usize,
+    bindings: &mut Vec<ParsedPythonBinding>,
+) {
+    if node.kind() == "identifier" {
+        if let Ok(name) = node.utf8_text(source.as_bytes()) {
+            bindings.push(ParsedPythonBinding {
+                name: name.to_owned(),
+                scope_start_byte,
+                kind,
+                visible_after_byte,
+            });
+        }
+        return;
+    }
+    if matches!(node.kind(), "attribute" | "subscript") {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        append_python_bindings(
+            child,
+            source,
+            scope_start_byte,
+            kind,
+            visible_after_byte,
+            bindings,
+        );
+    }
+}
+
+fn python_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    match parameter.kind() {
+        "identifier" => Some(parameter),
+        "typed_parameter" => parameter
+            .named_children(&mut parameter.walk())
+            .find(|child| {
+                matches!(
+                    child.kind(),
+                    "identifier" | "list_splat_pattern" | "dictionary_splat_pattern"
+                )
+            }),
+        "default_parameter" | "typed_default_parameter" => parameter.child_by_field_name("name"),
+        "list_splat" | "dictionary_splat" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+            parameter.named_child(0)
+        }
+        _ => None,
+    }
+}
+
+fn nearest_python_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "function_definition" | "class_definition") {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn nearest_python_scope_start(node: Node<'_>) -> Option<usize> {
+    nearest_python_declaration(node)
+        .map(|owner| declaration_span_node(owner, Language::Python).start_byte())
+}
+
+fn python_call_context(node: Node<'_>) -> (Option<usize>, Option<usize>) {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "function_definition" | "class_definition") {
+            let declaration = declaration_span_node(parent, Language::Python);
+            let body_contains_call = parent.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()
+            });
+            if body_contains_call {
+                let start = Some(declaration.start_byte());
+                return (start, start);
+            }
+            return (
+                lexical_owner_start_byte(parent, Language::Python),
+                lexical_owner_start_byte(parent, Language::Python),
+            );
+        }
+        current = parent;
+    }
+    (None, None)
+}
+
+fn python_decorated_target(decorator: Node<'_>) -> Option<Node<'_>> {
+    let decorated = decorator.parent()?;
+    if decorated.kind() != "decorated_definition" {
+        return None;
+    }
+    let mut cursor = decorated.walk();
+    decorated
+        .named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "function_definition" | "class_definition"))
+}
+
+fn decorator_callable(expression: Node<'_>) -> Node<'_> {
+    if expression.kind() == "call" {
+        expression
+            .child_by_field_name("function")
+            .unwrap_or(expression)
+    } else {
+        expression
+    }
+}
+
+const fn python_binding_kind_order(kind: PythonBindingKind) -> u8 {
+    match kind {
+        PythonBindingKind::Local => 0,
+        PythonBindingKind::Declaration => 1,
+        PythonBindingKind::Import => 2,
+        PythonBindingKind::ConditionalDeclaration => 3,
+        PythonBindingKind::ConditionalImport => 4,
+        PythonBindingKind::Delete => 5,
+        PythonBindingKind::Global => 6,
+        PythonBindingKind::Nonlocal => 7,
+    }
+}
+
 fn append_python_imports(node: Node<'_>, source: &str, imports: &mut Vec<ParsedImport>) {
     match node.kind() {
         "import_statement" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                let name = if child.kind() == "aliased_import" {
-                    child.child_by_field_name("name")
-                } else if child.kind() == "dotted_name" {
-                    Some(child)
-                } else {
-                    None
-                };
-                if let Some(name) = name {
-                    append_import(node, name, source, imports);
+                if matches!(child.kind(), "aliased_import" | "dotted_name") {
+                    append_python_import(node, child, source, imports);
                 }
             }
         }
@@ -1515,12 +3116,108 @@ fn append_python_imports(node: Node<'_>, source: &str, imports: &mut Vec<ParsedI
                 // attribute or an imported submodule at runtime. Preserve the
                 // verified dependency on the package (`.`) instead of guessing
                 // a `pkg.util` source edge.
-                append_import(node, module, source, imports);
+                let bindings = python_from_import_bindings(node, source);
+                append_import_with_bindings(node, module, source, bindings, imports);
             }
         }
-        "future_import_statement" => append_import_specifier(node, "__future__", imports),
+        "future_import_statement" => {
+            let bindings = python_from_import_bindings(node, source);
+            append_import_specifier_with_bindings(node, "__future__", bindings, imports);
+        }
         _ => {}
     }
+}
+
+fn append_python_import(
+    statement: Node<'_>,
+    name_node: Node<'_>,
+    source: &str,
+    imports: &mut Vec<ParsedImport>,
+) {
+    let imported_node = if name_node.kind() == "aliased_import" {
+        name_node.child_by_field_name("name")
+    } else {
+        Some(name_node)
+    };
+    let Some(imported_node) = imported_node else {
+        return;
+    };
+    let Ok(imported_name) = imported_node.utf8_text(source.as_bytes()) else {
+        return;
+    };
+    let imported_name = imported_name.trim();
+    if imported_name.is_empty() {
+        return;
+    }
+    let binding_node = name_node
+        .child_by_field_name("alias")
+        .unwrap_or(imported_node);
+    let Ok(binding) = binding_node.utf8_text(source.as_bytes()) else {
+        return;
+    };
+    let binding = if name_node.kind() == "aliased_import" {
+        binding.trim()
+    } else {
+        imported_name.split('.').next().unwrap_or(imported_name)
+    };
+    let binding = ParsedImportBinding {
+        imported_name: imported_name.to_owned(),
+        qualifier: None,
+        binding_name: binding.to_owned(),
+    };
+    append_import_with_bindings(statement, imported_node, source, vec![binding], imports);
+}
+
+fn python_from_import_bindings(statement: Node<'_>, source: &str) -> Vec<ParsedImportBinding> {
+    let mut result = Vec::new();
+    let mut cursor = statement.walk();
+    for child in statement.named_children(&mut cursor) {
+        if Some(child) == statement.child_by_field_name("module_name") {
+            continue;
+        }
+        match child.kind() {
+            "aliased_import" | "dotted_name" => {
+                let imported_node = child.child_by_field_name("name").unwrap_or(child);
+                let binding_node = child.child_by_field_name("alias").unwrap_or(imported_node);
+                let (Ok(imported), Ok(binding)) = (
+                    imported_node.utf8_text(source.as_bytes()),
+                    binding_node.utf8_text(source.as_bytes()),
+                ) else {
+                    continue;
+                };
+                let imported = imported.trim();
+                let binding = binding.trim();
+                if !imported.is_empty() && !binding.is_empty() {
+                    result.push(ParsedImportBinding {
+                        imported_name: imported.to_owned(),
+                        qualifier: statement
+                            .child_by_field_name("module_name")
+                            .and_then(|module| module.utf8_text(source.as_bytes()).ok())
+                            .map(str::trim)
+                            .filter(|module| !module.is_empty())
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                (statement.kind() == "future_import_statement")
+                                    .then(|| "__future__".to_owned())
+                            }),
+                        binding_name: binding.to_owned(),
+                    });
+                }
+            }
+            "wildcard_import" => result.push(ParsedImportBinding {
+                imported_name: "*".to_owned(),
+                qualifier: statement
+                    .child_by_field_name("module_name")
+                    .and_then(|module| module.utf8_text(source.as_bytes()).ok())
+                    .map(str::trim)
+                    .filter(|module| !module.is_empty())
+                    .map(str::to_owned),
+                binding_name: "*".to_owned(),
+            }),
+            _ => {}
+        }
+    }
+    result
 }
 
 fn append_import(
@@ -1536,14 +3233,48 @@ fn append_import(
 }
 
 fn append_import_specifier(statement: Node<'_>, specifier: &str, imports: &mut Vec<ParsedImport>) {
+    append_import_specifier_with_bindings(statement, specifier, Vec::new(), imports);
+}
+
+fn append_import_with_bindings(
+    statement: Node<'_>,
+    specifier_node: Node<'_>,
+    source: &str,
+    bindings: Vec<ParsedImportBinding>,
+    imports: &mut Vec<ParsedImport>,
+) {
+    if let Ok(raw) = specifier_node.utf8_text(source.as_bytes()) {
+        let specifier = raw.trim().trim_matches(['\'', '"', '`']);
+        append_import_specifier_with_bindings(statement, specifier, bindings, imports);
+    }
+}
+
+fn append_import_specifier_with_bindings(
+    statement: Node<'_>,
+    specifier: &str,
+    bindings: Vec<ParsedImportBinding>,
+    imports: &mut Vec<ParsedImport>,
+) {
     if !specifier.is_empty() {
         imports.push(ParsedImport {
             specifier: specifier.to_owned(),
+            bindings,
+            scope_start_byte: nearest_python_scope_start(statement),
             start_byte: statement.start_byte(),
             end_byte: statement.end_byte(),
             start_line: one_based_row(statement.start_position().row),
             end_line: one_based_row(statement.end_position().row),
+            conditional_binding: python_binding_is_conditional(statement),
         });
+    }
+}
+
+fn parsed_span(node: Node<'_>) -> ParsedSpan {
+    ParsedSpan {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: one_based_row(node.start_position().row),
+        end_line: one_based_row(node.end_position().row),
     }
 }
 
@@ -1624,6 +3355,9 @@ fn parse_markdown(source: &str) -> Vec<ParsedSymbol> {
                     start_line: u32::try_from(index + 1).unwrap_or(u32::MAX),
                     end_line: u32::try_from(index + 1).unwrap_or(u32::MAX),
                     docstring: None,
+                    owner_start_byte: None,
+                    qualified_name: name.to_owned(),
+                    conditional_binding: false,
                 });
             }
         }
@@ -1746,6 +3480,26 @@ const fn entity_kind_label(kind: EntityKind) -> &'static str {
     }
 }
 
+const fn semantic_reference_kind_label(kind: SemanticReferenceKind) -> &'static str {
+    match kind {
+        SemanticReferenceKind::ImportBinding => "import_binding",
+        SemanticReferenceKind::Call => "call",
+        SemanticReferenceKind::Extends => "extends",
+        SemanticReferenceKind::TypeUse => "type_use",
+        SemanticReferenceKind::Decorator => "decorator",
+    }
+}
+
+const fn relationship_kind_for_semantic_reference(kind: SemanticReferenceKind) -> RelationshipKind {
+    match kind {
+        SemanticReferenceKind::ImportBinding => RelationshipKind::Imports,
+        SemanticReferenceKind::Call => RelationshipKind::Calls,
+        SemanticReferenceKind::Extends => RelationshipKind::Extends,
+        SemanticReferenceKind::TypeUse => RelationshipKind::TypeUses,
+        SemanticReferenceKind::Decorator => RelationshipKind::DecoratedBy,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fingerprint_ir(
     repository: &RepositoryMetadata,
@@ -1754,6 +3508,8 @@ fn fingerprint_ir(
     imports: &[ImportRecord],
     evidence: &[EvidenceRef],
     relationships: &[Relationship],
+    semantic_references: &[SemanticReference],
+    semantic_coverage: &SemanticCoverage,
     claims: &[Claim],
     coverage: &CoverageReport,
 ) -> Result<String, serde_json::Error> {
@@ -1769,6 +3525,8 @@ fn fingerprint_ir(
         imports,
         evidence,
         relationships,
+        semantic_references,
+        semantic_coverage,
         deterministic_claims,
         coverage,
     ))?;
@@ -1777,16 +3535,23 @@ fn fingerprint_ir(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+    };
 
+    use super::fingerprint_ir;
     use super::{
         RelativeImportFailure, RootIdentity, ScanOptions, concept_id_for_path, file_path_metadata,
-        parse_markdown, resolve_relative_javascript_target, scan_repository,
+        parse_markdown, python_module_case_guard, resolve_relative_javascript_target,
+        scan_repository,
     };
     #[cfg(any(unix, windows))]
     use super::{open_stable_file, verify_stable_file};
     use crate::{
-        CoverageDisposition, CoverageKind, EntityKind, Language, RelationshipKind, ScanStatus,
+        ArchitectureScope, CoverageDisposition, CoverageKind, EntityKind, Language,
+        RelationshipKind, RelationshipOrigin, RepositoryIr, ScanStatus, SemanticCoverage,
+        SemanticReferenceKind, SemanticResolution,
     };
 
     #[test]
@@ -2114,6 +3879,1462 @@ mod tests {
                 .filter(|evidence| evidence.path == "lib.rs")
                 .all(|evidence| evidence.content_hash == expected_hash)
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture verifies correlated ownership, references, resolution and edges"
+    )]
+    fn resolves_conservative_python_semantics_and_preserves_uncertainty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("pkg")).expect("package");
+        fs::write(temp.path().join("pkg/__init__.py"), "").expect("package init");
+        fs::write(
+            temp.path().join("pkg/models.py"),
+            concat!(
+                "class Base:\n",
+                "    pass\n",
+                "\n",
+                "class Result:\n",
+                "    pass\n",
+            ),
+        )
+        .expect("model fixture");
+        fs::write(
+            temp.path().join("pkg/service.py"),
+            concat!(
+                "from .models import Base as Parent, Result\n",
+                "\n",
+                "def traced(value):\n",
+                "    return value\n",
+                "\n",
+                "@traced\n",
+                "class Service(Parent):\n",
+                "    def build(self, value: Result) -> Result:\n",
+                "        return traced(value)\n",
+                "\n",
+                "def shadowed(traced):\n",
+                "    return traced()\n",
+                "\n",
+                "def dynamic(obj):\n",
+                "    return obj.run()\n",
+                "\n",
+                "def loop_shadow(values):\n",
+                "    for traced in values:\n",
+                "        pass\n",
+                "    return traced()\n",
+                "\n",
+                "def match_shadow(value):\n",
+                "    match value:\n",
+                "        case traced:\n",
+                "            pass\n",
+                "    return traced()\n",
+            ),
+        )
+        .expect("service fixture");
+
+        let first = scan_repository(temp.path(), &ScanOptions::default()).expect("first scan");
+        let second = scan_repository(temp.path(), &ScanOptions::default()).expect("second scan");
+        assert_eq!(first, second);
+        first.validate().expect("semantic IR");
+
+        let service = first
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Service")
+            .expect("Service entity");
+        assert_eq!(service.qualified_name, "pkg.service.Service");
+        let build = first
+            .entities
+            .iter()
+            .find(|entity| entity.name == "build")
+            .expect("build entity");
+        assert_eq!(build.qualified_name, "pkg.service.Service.build");
+        assert_eq!(build.owner_id.as_deref(), Some(service.id.as_str()));
+
+        let parent_import = first
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("Parent")
+            })
+            .expect("Parent binding");
+        assert_eq!(parent_import.name, "Base");
+        assert!(matches!(
+            parent_import.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+        let parent_evidence = first
+            .evidence
+            .iter()
+            .find(|evidence| evidence.id == parent_import.evidence_id)
+            .expect("Parent import evidence");
+        let service_source =
+            fs::read_to_string(temp.path().join("pkg/service.py")).expect("service source");
+        assert_eq!(
+            evidence_source(&service_source, parent_evidence),
+            "from .models import Base as Parent, Result"
+        );
+        for import in first
+            .imports
+            .iter()
+            .filter(|import| import.path == "pkg/service.py")
+        {
+            let semantic_bindings = first
+                .semantic_references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == SemanticReferenceKind::ImportBinding
+                        && reference.path == import.path
+                        && (reference.qualifier.as_deref() == Some(import.specifier.as_str())
+                            || reference.qualifier.is_none() && reference.name == import.specifier)
+                })
+                .count();
+            assert!(
+                semantic_bindings > 0,
+                "compatibility import {} lacks semantic bindings",
+                import.specifier
+            );
+        }
+        let parent_edge = first
+            .relationships
+            .iter()
+            .find(|relationship| {
+                relationship.kind == RelationshipKind::Imports
+                    && matches!(
+                        &relationship.origin,
+                        RelationshipOrigin::SemanticReference { reference_id }
+                            if reference_id == &parent_import.id
+                    )
+            })
+            .expect("semantic import-binding edge");
+        assert_eq!(
+            parent_edge.evidence_ids.as_slice(),
+            std::slice::from_ref(&parent_import.evidence_id)
+        );
+
+        for (kind, name) in [
+            (SemanticReferenceKind::Extends, "Parent"),
+            (SemanticReferenceKind::Decorator, "traced"),
+            (SemanticReferenceKind::TypeUse, "Result"),
+            (SemanticReferenceKind::Call, "traced"),
+        ] {
+            assert!(
+                first.semantic_references.iter().any(|reference| {
+                    reference.kind == kind
+                        && reference.name == name
+                        && matches!(reference.resolution, SemanticResolution::Resolved { .. })
+                }),
+                "missing resolved {kind:?} {name}; references: {:#?}",
+                first.semantic_references
+            );
+        }
+        for kind in [
+            RelationshipKind::Calls,
+            RelationshipKind::Extends,
+            RelationshipKind::TypeUses,
+            RelationshipKind::DecoratedBy,
+        ] {
+            assert!(first.relationships.iter().any(|relationship| {
+                relationship.kind == kind
+                    && matches!(
+                        relationship.origin,
+                        RelationshipOrigin::SemanticReference { .. }
+                    )
+                    && !relationship.evidence_ids.is_empty()
+            }));
+        }
+
+        let shadowed_call = first
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call
+                    && reference.name == "traced"
+                    && first
+                        .entities
+                        .iter()
+                        .find(|entity| entity.id == reference.scope_id)
+                        .is_some_and(|entity| entity.name == "shadowed")
+            })
+            .expect("shadowed call");
+        assert!(matches!(
+            shadowed_call.resolution,
+            SemanticResolution::Unresolved { .. }
+        ));
+        let loop_call = first
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call
+                    && reference.name == "traced"
+                    && first
+                        .entities
+                        .iter()
+                        .find(|entity| entity.id == reference.scope_id)
+                        .is_some_and(|entity| entity.name == "loop_shadow")
+            })
+            .expect("for-target shadowed call");
+        assert!(matches!(
+            loop_call.resolution,
+            SemanticResolution::Unresolved { .. }
+        ));
+        let match_call = first
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call
+                    && reference.name == "traced"
+                    && first
+                        .entities
+                        .iter()
+                        .find(|entity| entity.id == reference.scope_id)
+                        .is_some_and(|entity| entity.name == "match_shadow")
+            })
+            .expect("match capture shadowed call");
+        assert!(matches!(
+            match_call.resolution,
+            SemanticResolution::Unresolved { .. }
+        ));
+        let member_call = first
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call && reference.name == "obj.run"
+            })
+            .expect("dynamic member call");
+        assert!(matches!(
+            member_call.resolution,
+            SemanticResolution::Unresolved { .. }
+        ));
+        assert_eq!(
+            first.semantic_coverage.total,
+            first.semantic_references.len()
+        );
+    }
+
+    #[test]
+    fn duplicate_python_import_roots_are_ambiguous_instead_of_guessed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("src/pkg")).expect("src package");
+        fs::create_dir_all(temp.path().join("pkg")).expect("root package");
+        fs::write(
+            temp.path().join("src/pkg/mod.py"),
+            "class Value:\n    pass\n",
+        )
+        .expect("src module");
+        fs::write(temp.path().join("pkg/mod.py"), "class Value:\n    pass\n").expect("root module");
+        fs::write(
+            temp.path().join("consumer.py"),
+            "from pkg.mod import Value\n",
+        )
+        .expect("consumer");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let binding = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("Value")
+            })
+            .expect("Value import binding");
+        assert!(matches!(
+            binding.resolution,
+            SemanticResolution::Ambiguous { .. } | SemanticResolution::Unresolved { .. }
+        ));
+        assert!(ir.relationships.iter().all(|relationship| {
+            !matches!(
+                &relationship.origin,
+                RelationshipOrigin::SemanticReference { reference_id }
+                    if reference_id == &binding.id
+            )
+        }));
+        ir.validate().expect("ambiguous semantic IR");
+    }
+
+    #[test]
+    fn python_definition_header_calls_use_the_enclosing_scope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("header.py"),
+            concat!(
+                "def function_scope(value=hidden()):\n",
+                "    def hidden():\n",
+                "        return 1\n",
+                "    return value\n",
+                "\n",
+                "class ClassScope(hidden()):\n",
+                "    def hidden(self):\n",
+                "        return 1\n",
+            ),
+        )
+        .expect("header fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let file_id = ir
+            .entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::File && entity.path == "header.py")
+            .map(|entity| entity.id.as_str())
+            .expect("file entity");
+        let header_calls = ir
+            .semantic_references
+            .iter()
+            .filter(|reference| {
+                reference.kind == SemanticReferenceKind::Call && reference.name == "hidden"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(header_calls.len(), 2);
+        for reference in header_calls {
+            assert_eq!(reference.scope_id, file_id);
+            assert_eq!(reference.source_entity_id, None);
+            assert!(matches!(
+                reference.resolution,
+                SemanticResolution::Unresolved { .. }
+            ));
+            assert!(!ir.relationships.iter().any(|relationship| {
+                matches!(
+                    &relationship.origin,
+                    RelationshipOrigin::SemanticReference { reference_id }
+                        if reference_id == &reference.id
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn nested_class_methods_do_not_resolve_bare_names_from_enclosing_classes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("nested.py"),
+            concat!(
+                "class Outer:\n",
+                "    def sibling(self):\n",
+                "        return 1\n",
+                "\n",
+                "    class Inner:\n",
+                "        def run(self):\n",
+                "            return sibling()\n",
+            ),
+        )
+        .expect("nested class fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let call = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call && reference.name == "sibling"
+            })
+            .expect("bare sibling call");
+        assert!(matches!(
+            call.resolution,
+            SemanticResolution::Unresolved { .. }
+        ));
+        assert!(!ir.relationships.iter().any(|relationship| {
+            matches!(
+                &relationship.origin,
+                RelationshipOrigin::SemanticReference { reference_id }
+                    if reference_id == &call.id
+            )
+        }));
+    }
+
+    #[test]
+    fn nested_class_bodies_skip_outer_classes_but_keep_valid_lexical_scopes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("nested_body.py"),
+            concat!(
+                "class Outer:\n",
+                "    def sibling(self):\n",
+                "        return 1\n",
+                "\n",
+                "    same_class = sibling(None)\n",
+                "\n",
+                "    class Inner:\n",
+                "        value = sibling()\n",
+                "\n",
+                "def enclosing():\n",
+                "    def lexical():\n",
+                "        return 1\n",
+                "\n",
+                "    class Inner:\n",
+                "        value = lexical()\n",
+                "\n",
+                "    return Inner\n",
+            ),
+        )
+        .expect("nested class-body fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let scope_name = |reference: &crate::SemanticReference| {
+            ir.entities
+                .iter()
+                .find(|entity| entity.id == reference.scope_id)
+                .map(|entity| entity.qualified_name.as_str())
+        };
+        let same_class_call = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call
+                    && reference.name == "sibling"
+                    && scope_name(reference) == Some("nested_body.Outer")
+            })
+            .expect("same-class body call");
+        assert!(matches!(
+            same_class_call.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+
+        let nested_class_call = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call
+                    && reference.name == "sibling"
+                    && scope_name(reference) == Some("nested_body.Outer.Inner")
+            })
+            .expect("nested class-body call");
+        assert!(matches!(
+            nested_class_call.resolution,
+            SemanticResolution::Unresolved { .. }
+        ));
+        assert!(!ir.relationships.iter().any(|relationship| {
+            matches!(
+                &relationship.origin,
+                RelationshipOrigin::SemanticReference { reference_id }
+                    if reference_id == &nested_class_call.id
+            )
+        }));
+
+        let enclosing_function_call = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call
+                    && reference.name == "lexical"
+                    && scope_name(reference) == Some("nested_body.enclosing.Inner")
+            })
+            .expect("enclosing function call");
+        assert!(matches!(
+            enclosing_function_call.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+        ir.validate().expect("conservative nested class-body IR");
+    }
+
+    #[test]
+    fn same_scope_declaration_and_import_collision_remains_unresolved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("collision.py"),
+            concat!(
+                "from outside import target\n",
+                "\n",
+                "def target():\n",
+                "    return 1\n",
+                "\n",
+                "def caller():\n",
+                "    return target()\n",
+            ),
+        )
+        .expect("collision fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let call = semantic_call(&ir, "target", "collision.caller");
+        assert_unresolved_without_edge(&ir, call);
+
+        fs::write(temp.path().join("models.py"), "class Base:\n    pass\n").expect("model fixture");
+        fs::write(
+            temp.path().join("extends_collision.py"),
+            concat!(
+                "from models import Base\n",
+                "\n",
+                "def Base():\n",
+                "    return 1\n",
+                "\n",
+                "class Child(Base):\n",
+                "    pass\n",
+            ),
+        )
+        .expect("extends collision fixture");
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("rescan");
+        let base = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Extends && reference.name == "Base"
+            })
+            .expect("conflicting base reference");
+        assert_unresolved_without_edge(&ir, base);
+    }
+
+    #[test]
+    fn ambiguous_import_binding_is_not_narrowed_by_reference_kind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("pkg")).expect("package");
+        fs::write(
+            temp.path().join("pkg/__init__.py"),
+            "def helper():\n    return 1\n",
+        )
+        .expect("package fixture");
+        fs::write(temp.path().join("pkg/helper.py"), "").expect("module fixture");
+        fs::write(
+            temp.path().join("consumer.py"),
+            "from pkg import helper\n\ndef caller():\n    return helper()\n",
+        )
+        .expect("consumer fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let binding = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("helper")
+            })
+            .expect("ambiguous helper binding");
+        assert!(matches!(
+            binding.resolution,
+            SemanticResolution::Ambiguous { .. }
+        ));
+        let call = semantic_call(&ir, "helper", "consumer.caller");
+        assert_unresolved_without_edge(&ir, call);
+    }
+
+    #[test]
+    fn wildcard_import_taints_bare_name_resolution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("wildcard.py"),
+            concat!(
+                "from plugin import *\n",
+                "\n",
+                "def known():\n",
+                "    return 1\n",
+                "\n",
+                "def caller():\n",
+                "    return known()\n",
+            ),
+        )
+        .expect("wildcard fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let call = semantic_call(&ir, "known", "wildcard.caller");
+        assert_unresolved_without_edge(&ir, call);
+    }
+
+    #[test]
+    fn class_body_resolves_only_same_class_declarations_already_executed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("ordered.py"),
+            concat!(
+                "class Ordered:\n",
+                "    def early(self):\n",
+                "        return 1\n",
+                "\n",
+                "    first = early(None)\n",
+                "    early = object()\n",
+                "    after_rebinding = early(None)\n",
+                "    second = later(None)\n",
+                "\n",
+                "    def later(self):\n",
+                "        return 2\n",
+                "\n",
+                "    def current(value=current()):\n",
+                "        return value\n",
+            ),
+        )
+        .expect("ordered class fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let early_calls = semantic_calls(&ir, "early", "ordered.Ordered");
+        assert_eq!(early_calls.len(), 2);
+        assert_eq!(
+            early_calls
+                .iter()
+                .filter(|reference| matches!(
+                    reference.resolution,
+                    SemanticResolution::Resolved { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            early_calls
+                .iter()
+                .filter(|reference| matches!(
+                    reference.resolution,
+                    SemanticResolution::Unresolved { .. }
+                ))
+                .count(),
+            1
+        );
+        let later = semantic_call(&ir, "later", "ordered.Ordered");
+        assert_unresolved_without_edge(&ir, later);
+        let current = semantic_call(&ir, "current", "ordered.Ordered");
+        assert_unresolved_without_edge(&ir, current);
+    }
+
+    #[test]
+    fn module_body_order_is_immediate_but_function_lookup_is_deferred() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("module_order.py"),
+            concat!(
+                "result = target()\n",
+                "\n",
+                "def caller():\n",
+                "    return target()\n",
+                "\n",
+                "def target():\n",
+                "    return 1\n",
+            ),
+        )
+        .expect("module order fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let module_call = semantic_call(&ir, "target", "module_order");
+        assert_unresolved_without_edge(&ir, module_call);
+        let function_call = semantic_call(&ir, "target", "module_order.caller");
+        assert!(matches!(
+            function_call.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+    }
+
+    #[test]
+    fn class_body_preserves_module_order_while_function_lookup_is_deferred() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("evaluation_order.py"),
+            concat!(
+                "def prior():\n",
+                "    return 1\n",
+                "\n",
+                "class Immediate:\n",
+                "    before = prior()\n",
+                "    after = later()\n",
+                "\n",
+                "def deferred():\n",
+                "    return later()\n",
+                "\n",
+                "def later():\n",
+                "    return 2\n",
+            ),
+        )
+        .expect("evaluation order fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let prior_class_call = semantic_call(&ir, "prior", "evaluation_order.Immediate");
+        assert!(matches!(
+            prior_class_call.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+        let later_class_call = semantic_call(&ir, "later", "evaluation_order.Immediate");
+        assert_unresolved_without_edge(&ir, later_class_call);
+        let later_function_call = semantic_call(&ir, "later", "evaluation_order.deferred");
+        assert!(matches!(
+            later_function_call.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+    }
+
+    #[test]
+    fn function_bindings_obey_statement_order_without_falling_back() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("pkg")).expect("package directory");
+        fs::write(
+            temp.path().join("pkg/__init__.py"),
+            "def helper():\n    return 1\n",
+        )
+        .expect("package fixture");
+        fs::write(
+            temp.path().join("binding_order.py"),
+            concat!(
+                "from pkg import helper\n",
+                "\n",
+                "def import_before_call():\n",
+                "    from pkg import helper\n",
+                "    return helper()\n",
+                "\n",
+                "def call_before_import():\n",
+                "    value = helper()\n",
+                "    from pkg import helper\n",
+                "    return value\n",
+                "\n",
+                "def inner():\n",
+                "    return 1\n",
+                "\n",
+                "def definition_before_call():\n",
+                "    def inner():\n",
+                "        return 2\n",
+                "    return inner()\n",
+                "\n",
+                "def call_before_definition():\n",
+                "    value = inner()\n",
+                "    def inner():\n",
+                "        return 3\n",
+                "    return value\n",
+            ),
+        )
+        .expect("binding order fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let prior_import = semantic_call(&ir, "helper", "binding_order.import_before_call");
+        assert!(matches!(
+            prior_import.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+        let later_import = semantic_call(&ir, "helper", "binding_order.call_before_import");
+        assert_unresolved_without_edge(&ir, later_import);
+        let prior_definition = semantic_call(&ir, "inner", "binding_order.definition_before_call");
+        assert!(matches!(
+            prior_definition.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+        let later_definition = semantic_call(&ir, "inner", "binding_order.call_before_definition");
+        assert_unresolved_without_edge(&ir, later_definition);
+    }
+
+    #[test]
+    fn conditional_python_bindings_taint_lookup_without_outer_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("pkg")).expect("package directory");
+        fs::write(
+            temp.path().join("pkg/__init__.py"),
+            "def helper():\n    return 1\n",
+        )
+        .expect("package fixture");
+        fs::write(
+            temp.path().join("conditional_bindings.py"),
+            concat!(
+                "def helper():\n",
+                "    return 0\n",
+                "\n",
+                "def conditional_if(flag):\n",
+                "    if flag:\n",
+                "        def helper():\n",
+                "            return 1\n",
+                "    return helper()\n",
+                "\n",
+                "def conditional_try():\n",
+                "    try:\n",
+                "        from pkg import helper\n",
+                "    except ImportError:\n",
+                "        pass\n",
+                "    return helper()\n",
+                "\n",
+                "def conditional_for(values):\n",
+                "    for _ in values:\n",
+                "        def helper():\n",
+                "            return 2\n",
+                "    return helper()\n",
+                "\n",
+                "def conditional_while(flag):\n",
+                "    while flag:\n",
+                "        def helper():\n",
+                "            return 3\n",
+                "    return helper()\n",
+                "\n",
+                "def conditional_match(value):\n",
+                "    match value:\n",
+                "        case 1:\n",
+                "            from pkg import helper\n",
+                "    return helper()\n",
+                "\n",
+                "def conditional_with(manager):\n",
+                "    with manager:\n",
+                "        from pkg import helper\n",
+                "    return helper()\n",
+                "\n",
+                "def conditional_class(flag):\n",
+                "    if flag:\n",
+                "        class helper:\n",
+                "            pass\n",
+                "    return helper()\n",
+                "\n",
+                "if FLAG:\n",
+                "    class Maybe:\n",
+                "        pass\n",
+                "\n",
+                "class Child(Maybe):\n",
+                "    pass\n",
+            ),
+        )
+        .expect("conditional binding fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        for scope in [
+            "conditional_bindings.conditional_if",
+            "conditional_bindings.conditional_try",
+            "conditional_bindings.conditional_for",
+            "conditional_bindings.conditional_while",
+            "conditional_bindings.conditional_match",
+            "conditional_bindings.conditional_with",
+            "conditional_bindings.conditional_class",
+        ] {
+            let call = semantic_call(&ir, "helper", scope);
+            assert_unresolved_without_edge(&ir, call);
+        }
+        let extends = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Extends && reference.name == "Maybe"
+            })
+            .expect("conditional class base");
+        assert_unresolved_without_edge(&ir, extends);
+    }
+
+    #[test]
+    fn imports_of_conditional_repository_members_stay_unresolved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("provider.py"),
+            concat!(
+                "if FLAG:\n",
+                "    class Maybe:\n",
+                "        def build():\n",
+                "            return 1\n",
+                "if FLAG:\n",
+                "    from pkg import helper as maybe_helper\n",
+            ),
+        )
+        .expect("conditional provider fixture");
+        fs::write(
+            temp.path().join("consumer.py"),
+            concat!(
+                "from provider import Maybe\n",
+                "from provider.Maybe import build\n",
+                "from provider import maybe_helper\n",
+                "\n",
+                "def caller():\n",
+                "    return Maybe(), build(), maybe_helper()\n",
+            ),
+        )
+        .expect("conditional consumer fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        for binding_name in ["Maybe", "build", "maybe_helper"] {
+            let binding = ir
+                .semantic_references
+                .iter()
+                .find(|reference| {
+                    reference.kind == SemanticReferenceKind::ImportBinding
+                        && reference.binding_name.as_deref() == Some(binding_name)
+                })
+                .expect("conditional import binding");
+            assert!(matches!(
+                binding.resolution,
+                SemanticResolution::Unresolved { .. }
+            ));
+            assert_unresolved_without_edge(&ir, binding);
+            let call = semantic_call(&ir, binding_name, "consumer.caller");
+            assert_unresolved_without_edge(&ir, call);
+        }
+    }
+
+    #[test]
+    fn missing_members_of_scanned_python_modules_are_not_external() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("provider.py"),
+            "def known():\n    return 1\n",
+        )
+        .expect("provider fixture");
+        fs::write(
+            temp.path().join("consumer.py"),
+            concat!(
+                "from provider import dynamic_name\n",
+                "from outside_package import external_name\n",
+                "\n",
+                "def caller():\n",
+                "    return dynamic_name(), external_name()\n",
+            ),
+        )
+        .expect("consumer fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let binding = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("dynamic_name")
+            })
+            .expect("dynamic import binding");
+        assert!(matches!(
+            binding.resolution,
+            SemanticResolution::Unresolved { .. }
+        ));
+        assert_unresolved_without_edge(&ir, binding);
+        let call = semantic_call(&ir, "dynamic_name", "consumer.caller");
+        assert_unresolved_without_edge(&ir, call);
+        let external_binding = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("external_name")
+            })
+            .expect("external import binding");
+        assert!(matches!(
+            external_binding.resolution,
+            SemanticResolution::External { .. }
+        ));
+        let external_call = semantic_call(&ir, "external_name", "consumer.caller");
+        assert!(matches!(
+            external_call.resolution,
+            SemanticResolution::External { .. }
+        ));
+    }
+
+    #[test]
+    fn uppercase_package_initializer_is_local_for_observed_and_semantic_imports() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("pkg")).expect("package directory");
+        fs::write(temp.path().join("pkg/__INIT__.PY"), "").expect("package initializer");
+        fs::write(temp.path().join("consumer.py"), "import pkg\n").expect("consumer fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let package = ir
+            .entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::File && entity.path == "pkg/__INIT__.PY")
+            .expect("package file");
+        let binding = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("pkg")
+            })
+            .expect("package binding");
+        assert!(matches!(
+            &binding.resolution,
+            SemanticResolution::Resolved { target_entity_id }
+                if target_entity_id == &package.id
+        ));
+        assert!(ir.relationships.iter().any(|relationship| {
+            relationship.kind == RelationshipKind::Imports && relationship.target == package.id
+        }));
+    }
+
+    #[test]
+    fn class_qualified_imports_do_not_masquerade_as_modules() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("provider.py"),
+            concat!(
+                "class Service:\n",
+                "    def build():\n",
+                "        return 1\n",
+            ),
+        )
+        .expect("provider fixture");
+        fs::write(
+            temp.path().join("consumer.py"),
+            concat!(
+                "from provider.Service import build\n",
+                "\n",
+                "def caller():\n",
+                "    return build()\n",
+            ),
+        )
+        .expect("consumer fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let binding = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("build")
+            })
+            .expect("build binding");
+        assert_unresolved_without_edge(&ir, binding);
+        let call = semantic_call(&ir, "build", "consumer.caller");
+        assert_unresolved_without_edge(&ir, call);
+    }
+
+    #[test]
+    fn ambiguous_qualifier_modules_are_not_narrowed_by_member_presence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("pkg")).expect("root package");
+        fs::create_dir_all(temp.path().join("src/pkg")).expect("src package");
+        fs::write(temp.path().join("pkg/mod.py"), "class Target:\n    pass\n")
+            .expect("root module");
+        fs::write(temp.path().join("src/pkg/mod.py"), "").expect("src module");
+        fs::write(
+            temp.path().join("consumer.py"),
+            "from pkg.mod import Target\n",
+        )
+        .expect("consumer fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let binding = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("Target")
+            })
+            .expect("Target binding");
+        assert_unresolved_without_edge(&ir, binding);
+    }
+
+    #[test]
+    fn global_and_nonlocal_mutations_fail_closed_before_redirect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("redirects.py"),
+            concat!(
+                "def target():\n",
+                "    return 1\n",
+                "\n",
+                "def global_delete():\n",
+                "    global target\n",
+                "    del target\n",
+                "    return target()\n",
+                "\n",
+                "def outer():\n",
+                "    def target():\n",
+                "        return 2\n",
+                "    def inner():\n",
+                "        nonlocal target\n",
+                "        del target\n",
+                "        return target()\n",
+                "    return inner\n",
+            ),
+        )
+        .expect("redirect fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        for scope in ["redirects.global_delete", "redirects.outer.inner"] {
+            let call = semantic_call(&ir, "target", scope);
+            assert_unresolved_without_edge(&ir, call);
+        }
+    }
+
+    #[test]
+    fn dotted_python_filenames_are_not_importable_module_identities() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("foo.bar.py"), "class Target:\n    pass\n")
+            .expect("dotted filename fixture");
+        fs::write(
+            temp.path().join("consumer.py"),
+            "from foo.bar import Target\n",
+        )
+        .expect("consumer fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let binding = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("Target")
+            })
+            .expect("Target binding");
+        assert!(matches!(
+            binding.resolution,
+            SemanticResolution::External { .. }
+        ));
+        assert!(!ir.relationships.iter().any(|relationship| {
+            matches!(
+                &relationship.origin,
+                RelationshipOrigin::SemanticReference { reference_id }
+                    if reference_id == &binding.id
+            )
+        }));
+    }
+
+    #[test]
+    fn portable_python_module_case_guard_rejects_mismatch_and_collision() {
+        let exact = BTreeMap::from([("Pkg".to_owned(), vec!["upper".to_owned()])]);
+        let portable = BTreeMap::from([("pkg".to_owned(), BTreeSet::from(["Pkg".to_owned()]))]);
+        assert!(matches!(
+            python_module_case_guard("pkg", &exact, &portable),
+            Some(SemanticResolution::Unresolved { .. })
+        ));
+
+        let exact = BTreeMap::from([
+            ("pkg".to_owned(), vec!["lower".to_owned()]),
+            ("Pkg".to_owned(), vec!["upper".to_owned()]),
+        ]);
+        let portable = BTreeMap::from([(
+            "pkg".to_owned(),
+            BTreeSet::from(["pkg".to_owned(), "Pkg".to_owned()]),
+        )]);
+        assert!(matches!(
+            python_module_case_guard("pkg", &exact, &portable),
+            Some(SemanticResolution::Unresolved { .. })
+        ));
+    }
+
+    #[test]
+    fn deleted_python_bindings_do_not_resolve_to_stale_declarations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("deleted_bindings.py"),
+            concat!(
+                "def module_removed():\n",
+                "    return 1\n",
+                "del module_removed\n",
+                "module_value = module_removed()\n",
+                "\n",
+                "class Removed:\n",
+                "    def member():\n",
+                "        return 2\n",
+                "    del member\n",
+                "    value = member()\n",
+                "\n",
+                "def remove_local():\n",
+                "    def inner():\n",
+                "        return 3\n",
+                "    del inner\n",
+                "    return inner()\n",
+            ),
+        )
+        .expect("deleted binding fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        for (name, scope) in [
+            ("module_removed", "deleted_bindings"),
+            ("member", "deleted_bindings.Removed"),
+            ("inner", "deleted_bindings.remove_local"),
+        ] {
+            let call = semantic_call(&ir, name, scope);
+            assert_unresolved_without_edge(&ir, call);
+        }
+    }
+
+    #[test]
+    fn comprehension_calls_are_inventoried_but_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("comprehension.py"),
+            concat!(
+                "def item():\n",
+                "    return 1\n",
+                "\n",
+                "class Container:\n",
+                "    def helper(self):\n",
+                "        return 1\n",
+                "\n",
+                "    list_values = [helper(None) for item in ()]\n",
+                "    set_values = {helper(None) for item in ()}\n",
+                "    dict_values = {item: helper(None) for item in ()}\n",
+                "    generator_values = (helper(None) for item in ())\n",
+                "    target_does_not_leak = item()\n",
+                "\n",
+                "def enclosing():\n",
+                "    def helper():\n",
+                "        return 1\n",
+                "\n",
+                "    list_values = [helper() for item in ()]\n",
+                "    set_values = {helper() for item in ()}\n",
+                "    dict_values = {item: helper() for item in ()}\n",
+                "    generator_values = (helper() for item in ())\n",
+                "    return helper(), item()\n",
+            ),
+        )
+        .expect("comprehension fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let class_calls = semantic_calls(&ir, "helper", "comprehension.Container");
+        assert_eq!(class_calls.len(), 4);
+        for call in class_calls {
+            assert_unresolved_without_edge(&ir, call);
+        }
+        let function_calls = ir
+            .semantic_references
+            .iter()
+            .filter(|reference| {
+                reference.kind == SemanticReferenceKind::Call
+                    && reference.name == "helper"
+                    && ir
+                        .entities
+                        .iter()
+                        .find(|entity| entity.id == reference.scope_id)
+                        .is_some_and(|entity| entity.qualified_name == "comprehension.enclosing")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(function_calls.len(), 5);
+        assert_eq!(
+            function_calls
+                .iter()
+                .filter(|reference| matches!(
+                    reference.resolution,
+                    SemanticResolution::Resolved { .. }
+                ))
+                .count(),
+            1
+        );
+        let unresolved = function_calls
+            .into_iter()
+            .filter(|reference| {
+                matches!(reference.resolution, SemanticResolution::Unresolved { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(unresolved.len(), 4);
+        for call in unresolved {
+            assert_unresolved_without_edge(&ir, call);
+        }
+        for scope in ["comprehension.Container", "comprehension.enclosing"] {
+            let item_call = semantic_call(&ir, "item", scope);
+            assert!(matches!(
+                item_call.resolution,
+                SemanticResolution::Resolved { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn match_capture_only_taints_its_name_and_keeps_other_case_calls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("matching.py"),
+            concat!(
+                "def known():\n",
+                "    return 1\n",
+                "\n",
+                "def captured():\n",
+                "    return 2\n",
+                "\n",
+                "def dispatch(value):\n",
+                "    match value:\n",
+                "        case captured:\n",
+                "            known()\n",
+                "    return captured()\n",
+            ),
+        )
+        .expect("match fixture");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let known = semantic_call(&ir, "known", "matching.dispatch");
+        assert!(matches!(
+            known.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+        let captured = semantic_call(&ir, "captured", "matching.dispatch");
+        assert_unresolved_without_edge(&ir, captured);
+    }
+
+    #[test]
+    fn uppercase_python_extensions_share_the_logical_module_inventory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("pkg")).expect("package");
+        fs::write(temp.path().join("pkg/__INIT__.PY"), "").expect("package init");
+        fs::write(
+            temp.path().join("pkg/helper.PY"),
+            "def target():\n    return 1\n",
+        )
+        .expect("helper module");
+        fs::write(
+            temp.path().join("pkg/consumer.PY"),
+            "from .helper import target\n\ndef caller():\n    return target()\n",
+        )
+        .expect("consumer module");
+
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        assert!(ir.entities.iter().any(|entity| {
+            entity.kind == EntityKind::File
+                && entity.path == "pkg/__INIT__.PY"
+                && entity.qualified_name == "pkg"
+        }));
+        let binding = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::ImportBinding
+                    && reference.binding_name.as_deref() == Some("target")
+            })
+            .expect("target binding");
+        assert!(matches!(
+            binding.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+        let call = semantic_call(&ir, "target", "pkg.consumer.caller");
+        assert!(matches!(
+            call.resolution,
+            SemanticResolution::Resolved { .. }
+        ));
+    }
+
+    fn semantic_call<'a>(
+        ir: &'a RepositoryIr,
+        name: &str,
+        scope_qualified_name: &str,
+    ) -> &'a crate::SemanticReference {
+        ir.semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call
+                    && reference.name == name
+                    && ir
+                        .entities
+                        .iter()
+                        .find(|entity| entity.id == reference.scope_id)
+                        .is_some_and(|entity| entity.qualified_name == scope_qualified_name)
+            })
+            .expect("semantic call")
+    }
+
+    fn semantic_calls<'a>(
+        ir: &'a RepositoryIr,
+        name: &str,
+        scope_qualified_name: &str,
+    ) -> Vec<&'a crate::SemanticReference> {
+        ir.semantic_references
+            .iter()
+            .filter(|reference| {
+                reference.kind == SemanticReferenceKind::Call
+                    && reference.name == name
+                    && ir
+                        .entities
+                        .iter()
+                        .find(|entity| entity.id == reference.scope_id)
+                        .is_some_and(|entity| entity.qualified_name == scope_qualified_name)
+            })
+            .collect()
+    }
+
+    fn assert_unresolved_without_edge(ir: &RepositoryIr, reference: &crate::SemanticReference) {
+        assert!(matches!(
+            reference.resolution,
+            SemanticResolution::Unresolved { .. }
+        ));
+        assert!(!ir.relationships.iter().any(|relationship| {
+            matches!(
+                &relationship.origin,
+                RelationshipOrigin::SemanticReference { reference_id }
+                    if reference_id == &reference.id
+            )
+        }));
+    }
+
+    #[test]
+    fn architecture_scope_totals_must_match_the_repository_ir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("scope.py"),
+            "def target():\n    pass\n\ndef caller():\n    target()\n",
+        )
+        .expect("scope fixture");
+        let mut ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let semantic_relationships_total = ir
+            .relationships
+            .iter()
+            .filter(|relationship| {
+                matches!(
+                    relationship.origin,
+                    RelationshipOrigin::SemanticReference { .. }
+                )
+            })
+            .count();
+        ir.architecture_scope = Some(ArchitectureScope {
+            evidence_total: ir.evidence.len(),
+            evidence_supplied: ir.evidence.len(),
+            coverage_items_total: ir.coverage.items.len(),
+            coverage_items_supplied: ir.coverage.items.len(),
+            entities_total: ir.entities.len(),
+            entities_supplied: ir.entities.len(),
+            semantic_references_total: ir.semantic_references.len(),
+            semantic_references_supplied: ir.semantic_references.len(),
+            semantic_relationships_total,
+            semantic_relationships_supplied: semantic_relationships_total,
+            complete: true,
+        });
+        ir.validate().expect("accurate architecture scope");
+
+        let scope = ir.architecture_scope.as_mut().expect("scope");
+        scope.semantic_references_total += 1;
+        scope.semantic_references_supplied += 1;
+        assert!(ir.validate().is_err());
+    }
+
+    #[test]
+    fn semantic_records_change_the_repository_fingerprint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("service.py"),
+            "def target():\n    pass\n\ndef caller():\n    target()\n",
+        )
+        .expect("fixture");
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let original = ir.fingerprint.clone();
+        let mut changed = ir.semantic_references.clone();
+        changed[0].resolution = SemanticResolution::Unresolved {
+            reason: "test mutation".to_owned(),
+        };
+        let fingerprint = fingerprint_ir(
+            &ir.repository,
+            &ir.files,
+            &ir.entities,
+            &ir.imports,
+            &ir.evidence,
+            &ir.relationships,
+            &changed,
+            &SemanticCoverage::from_references(&changed),
+            &ir.claims,
+            &ir.coverage,
+        )
+        .expect("fingerprint");
+        assert_ne!(original, fingerprint);
+    }
+
+    #[test]
+    fn validation_rejects_source_evidence_hash_and_span_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("source.py"), "def source():\n    pass\n").expect("fixture");
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+
+        let mut wrong_hash = ir.clone();
+        wrong_hash.evidence[0].content_hash = "wrong".to_owned();
+        assert!(wrong_hash.validate().is_err());
+
+        let mut wrong_span = ir;
+        wrong_span.evidence[0].end_byte = wrong_span.files[0].size + 1;
+        assert!(wrong_span.validate().is_err());
+    }
+
+    #[test]
+    fn imported_module_alias_called_as_function_remains_unresolved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("helpers.py"), "def run():\n    pass\n").expect("module");
+        fs::write(
+            temp.path().join("consumer.py"),
+            "import helpers as make\n\ndef consumer():\n    make()\n",
+        )
+        .expect("consumer");
+        let ir = scan_repository(temp.path(), &ScanOptions::default()).expect("scan");
+        let call = ir
+            .semantic_references
+            .iter()
+            .find(|reference| {
+                reference.kind == SemanticReferenceKind::Call && reference.name == "make"
+            })
+            .expect("module alias call");
+        assert!(matches!(
+            call.resolution,
+            SemanticResolution::Unresolved { .. }
+        ));
+        assert!(ir.relationships.iter().all(|relationship| {
+            !matches!(
+                &relationship.origin,
+                RelationshipOrigin::SemanticReference { reference_id }
+                    if reference_id == &call.id
+            )
+        }));
+        ir.validate().expect("conservative module call IR");
     }
 
     #[test]

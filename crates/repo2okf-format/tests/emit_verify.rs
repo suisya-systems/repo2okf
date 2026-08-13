@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use repo2okf_format::{
-    CoverageClassification, CoverageItem, EmitError, EvidenceRecord, Generated, OkfClaim,
-    OkfDocument, OkfRelationship, RepositorySnapshot, Severity, Verification, VerifyOptions,
-    concept_path, emit_okf, verify_okf,
+    ArchitectureScope, CoverageClassification, CoverageItem, EmitError, EvidenceRecord, Generated,
+    OkfArchitectureConcept, OkfClaim, OkfDocument, OkfRelationship, OkfStatus,
+    ProjectedSemanticRelationship, Repo2OkfMetadata, RepositorySnapshot, SemanticInventory,
+    Severity, Verification, VerifyOptions, concept_path, emit_okf, verify_okf,
 };
 use tempfile::TempDir;
 
@@ -51,7 +52,83 @@ fn snapshot() -> RepositorySnapshot {
                 concept_id: "modules/auth".to_owned(),
             },
         }],
+        semantic_inventory: None,
     }
+}
+
+fn semantic_snapshot() -> RepositorySnapshot {
+    let mut snapshot = snapshot();
+    let mut data = document("modules/data", "ev-data");
+    "validates-data".clone_into(&mut data.claims[0].id);
+    snapshot.documents.push(data);
+    snapshot
+        .evidence
+        .push(evidence("ev-data", "src/data.rs", "blake3:data"));
+    snapshot.coverage.push(CoverageItem {
+        id: "file:src/data.rs".to_owned(),
+        classification: CoverageClassification::Included {
+            concept_id: "modules/data".to_owned(),
+        },
+    });
+    // Keep a second valid source attached to the source concept so swapping
+    // relationship evidence cannot be caught merely as a dangling source.
+    snapshot.documents[0].claims[0]
+        .evidence_ids
+        .push("ev-data".to_owned());
+    snapshot.documents[0].relationships.push(OkfRelationship {
+        target: "modules/data".to_owned(),
+        label: Some("Data".to_owned()),
+        kind: Some("calls".to_owned()),
+        source_relationship_ids: vec!["edge-call".to_owned()],
+        origin_reference_ids: vec!["ref-call".to_owned()],
+        evidence_ids: vec!["ev-auth".to_owned()],
+    });
+    snapshot.semantic_inventory = Some(SemanticInventory {
+        entity_ids: vec!["caller".to_owned(), "callee".to_owned()],
+        relationship_ids: vec!["edge-call".to_owned(), "edge-other".to_owned()],
+        resolved_reference_ids: vec!["ref-call".to_owned(), "ref-other".to_owned()],
+        architecture_concept_ids: Vec::new(),
+        projection_contract_complete: true,
+        projected_relationships: vec![ProjectedSemanticRelationship {
+            source_concept_id: "modules/auth".to_owned(),
+            target_concept_id: "modules/data".to_owned(),
+            kind: "calls".to_owned(),
+            source_relationship_ids: vec!["edge-call".to_owned()],
+            origin_reference_ids: vec!["ref-call".to_owned()],
+            evidence_ids: vec!["ev-auth".to_owned()],
+        }],
+        architecture_scope: None,
+    });
+    snapshot
+}
+
+fn semantic_self_snapshot() -> RepositorySnapshot {
+    let mut snapshot = snapshot();
+    snapshot.documents[0].relationships.push(OkfRelationship {
+        target: "modules/auth".to_owned(),
+        label: Some("Authentication".to_owned()),
+        kind: Some("calls".to_owned()),
+        source_relationship_ids: vec!["edge-self-call".to_owned()],
+        origin_reference_ids: vec!["ref-self-call".to_owned()],
+        evidence_ids: vec!["ev-auth".to_owned()],
+    });
+    snapshot.semantic_inventory = Some(SemanticInventory {
+        entity_ids: vec!["caller".to_owned(), "callee".to_owned()],
+        relationship_ids: vec!["edge-self-call".to_owned(), "edge-other".to_owned()],
+        resolved_reference_ids: vec!["ref-self-call".to_owned(), "ref-other".to_owned()],
+        architecture_concept_ids: Vec::new(),
+        projection_contract_complete: true,
+        projected_relationships: vec![ProjectedSemanticRelationship {
+            source_concept_id: "modules/auth".to_owned(),
+            target_concept_id: "modules/auth".to_owned(),
+            kind: "calls".to_owned(),
+            source_relationship_ids: vec!["edge-self-call".to_owned()],
+            origin_reference_ids: vec!["ref-self-call".to_owned()],
+            evidence_ids: vec!["ev-auth".to_owned()],
+        }],
+        architecture_scope: None,
+    });
+    snapshot
 }
 
 #[test]
@@ -96,6 +173,9 @@ fn emission_is_deterministic_across_input_order() {
         target: "modules/data".to_owned(),
         label: Some("data module".to_owned()),
         kind: Some("depends-on".to_owned()),
+        source_relationship_ids: Vec::new(),
+        origin_reference_ids: Vec::new(),
+        evidence_ids: Vec::new(),
     });
     left.evidence
         .push(evidence("ev-data", "src/data.rs", "blake3:data"));
@@ -118,6 +198,448 @@ fn emission_is_deterministic_across_input_order() {
     emit_okf(&left, first.path()).unwrap();
     emit_okf(&right, second.path()).unwrap();
     assert_eq!(read_tree(first.path()), read_tree(second.path()));
+}
+
+#[test]
+fn emits_and_verifies_evidence_bound_semantic_relationships() {
+    let temp = TempDir::new().unwrap();
+    let mut snapshot = snapshot();
+    let mut data = document("modules/data", "ev-data");
+    data.claims[0].id = "validates-data".to_owned();
+    snapshot.documents.push(data);
+    snapshot
+        .evidence
+        .push(evidence("ev-data", "src/data.rs", "blake3:data"));
+    snapshot.coverage.push(CoverageItem {
+        id: "file:src/data.rs".to_owned(),
+        classification: CoverageClassification::Included {
+            concept_id: "modules/data".to_owned(),
+        },
+    });
+    snapshot.documents[0].relationships.push(OkfRelationship {
+        target: "modules/data".to_owned(),
+        label: Some("Data".to_owned()),
+        kind: Some("calls".to_owned()),
+        source_relationship_ids: vec!["edge-call".to_owned()],
+        origin_reference_ids: vec!["ref-call".to_owned()],
+        evidence_ids: vec!["ev-auth".to_owned()],
+    });
+    snapshot.semantic_inventory = Some(SemanticInventory {
+        entity_ids: vec!["caller".to_owned(), "callee".to_owned()],
+        relationship_ids: vec!["edge-call".to_owned()],
+        resolved_reference_ids: vec!["ref-call".to_owned()],
+        architecture_concept_ids: Vec::new(),
+        projection_contract_complete: true,
+        projected_relationships: vec![ProjectedSemanticRelationship {
+            source_concept_id: "modules/auth".to_owned(),
+            target_concept_id: "modules/data".to_owned(),
+            kind: "calls".to_owned(),
+            source_relationship_ids: vec!["edge-call".to_owned()],
+            origin_reference_ids: vec!["ref-call".to_owned()],
+            evidence_ids: vec!["ev-auth".to_owned()],
+        }],
+        architecture_scope: None,
+    });
+
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let contents = fs::read_to_string(temp.path().join("modules/auth.md")).unwrap();
+    assert_eq!(contents, include_str!("golden/semantic_relationship.md"));
+    assert!(contents.contains("source_relationship_ids:"));
+    assert!(contents.contains("- edge-call"));
+    assert!(contents.contains("origin_reference_ids:"));
+    assert!(contents.contains("- ref-call"));
+    assert!(contents.contains("evidence_ids:"));
+    assert!(contents.contains("[^evidence-65762d61757468]"));
+
+    let options = VerifyOptions {
+        semantic_inventory: snapshot.semantic_inventory.clone(),
+        ..VerifyOptions::default()
+    };
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &options,
+    );
+    assert!(report.valid, "{:#?}", report.issues);
+}
+
+#[test]
+fn emits_and_exactly_verifies_self_concept_semantic_relationships() {
+    let temp = TempDir::new().unwrap();
+    let snapshot = semantic_self_snapshot();
+    let options = VerifyOptions {
+        semantic_inventory: snapshot.semantic_inventory.clone(),
+        ..VerifyOptions::default()
+    };
+    let path = temp.path().join("modules/auth.md");
+
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("target: modules/auth"));
+    assert!(contents.contains("    - edge-self-call"));
+    assert!(contents.contains("    - ref-self-call"));
+    assert!(contents.contains("    - ev-auth"));
+    assert!(contents.contains("[Authentication](/modules/auth.md)"));
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &options,
+    );
+    assert!(report.valid, "{:#?}", report.issues);
+
+    fs::write(
+        &path,
+        contents.replacen("    - ref-self-call", "    - ref-other", 1),
+    )
+    .unwrap();
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &options,
+    );
+    assert!(report.has_code("semantic-projection-mismatch"));
+    assert!(report.has_code("missing-semantic-projection"));
+    assert!(report.has_code("unexpected-semantic-projection"));
+    assert!(!report.has_code("non-resolved-relationship-origin"));
+
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let contents = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        contents.replacen("  relationships:\n", "  removed_relationships:\n", 1),
+    )
+    .unwrap();
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &options,
+    );
+    assert!(report.has_code("missing-semantic-projection"));
+}
+
+#[test]
+fn emitter_requires_the_complete_canonical_semantic_projection() {
+    let temp = TempDir::new().unwrap();
+    let mut snapshot = semantic_snapshot();
+    snapshot.documents[0].relationships[0].origin_reference_ids = vec!["ref-other".to_owned()];
+    assert!(matches!(
+        emit_okf(&snapshot, temp.path()).unwrap_err(),
+        EmitError::SemanticProjectionMismatch { .. }
+    ));
+
+    let mut snapshot = semantic_snapshot();
+    snapshot.documents[0].relationships.clear();
+    assert!(matches!(
+        emit_okf(&snapshot, temp.path()).unwrap_err(),
+        EmitError::SemanticProjectionMismatch { .. }
+    ));
+}
+
+#[test]
+fn verifier_rejects_recombined_valid_semantic_ids_and_evidence() {
+    let temp = TempDir::new().unwrap();
+    let snapshot = semantic_snapshot();
+    let options = VerifyOptions {
+        semantic_inventory: snapshot.semantic_inventory.clone(),
+        ..VerifyOptions::default()
+    };
+
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let path = temp.path().join("modules/auth.md");
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("    - ref-call"));
+    fs::write(
+        &path,
+        contents.replacen("    - ref-call", "    - ref-other", 1),
+    )
+    .unwrap();
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &options,
+    );
+    assert!(report.has_code("semantic-projection-mismatch"));
+    assert!(report.has_code("missing-semantic-projection"));
+    assert!(report.has_code("unexpected-semantic-projection"));
+    assert!(!report.has_code("non-resolved-relationship-origin"));
+
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let contents = fs::read_to_string(&path).unwrap();
+    let relationship_evidence = concat!(
+        "    origin_reference_ids:\n",
+        "    - ref-call\n",
+        "    evidence_ids:\n",
+        "    - ev-auth",
+    );
+    assert!(contents.contains(relationship_evidence));
+    fs::write(
+        &path,
+        contents.replacen(
+            relationship_evidence,
+            concat!(
+                "    origin_reference_ids:\n",
+                "    - ref-call\n",
+                "    evidence_ids:\n",
+                "    - ev-data",
+            ),
+            1,
+        ),
+    )
+    .unwrap();
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &options,
+    );
+    assert!(report.has_code("semantic-projection-mismatch"));
+    assert!(!report.has_code("unresolved-evidence-id"));
+    assert!(!report.has_code("relationship-evidence-not-sourced"));
+}
+
+#[test]
+fn verifier_rejects_a_missing_expected_projection_and_modern_empty_contract() {
+    let temp = TempDir::new().unwrap();
+    let snapshot = semantic_snapshot();
+    let path = temp.path().join("modules/auth.md");
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("  relationships:\n"));
+    fs::write(
+        &path,
+        contents.replacen("  relationships:\n", "  removed_relationships:\n", 1),
+    )
+    .unwrap();
+    let options = VerifyOptions {
+        semantic_inventory: snapshot.semantic_inventory.clone(),
+        ..VerifyOptions::default()
+    };
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &options,
+    );
+    assert!(report.has_code("missing-semantic-projection"));
+
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let mut empty_contract = snapshot.semantic_inventory.clone().unwrap();
+    empty_contract.projected_relationships.clear();
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &VerifyOptions {
+            semantic_inventory: Some(empty_contract),
+            ..VerifyOptions::default()
+        },
+    );
+    assert!(report.has_code("semantic-projection-mismatch"));
+    assert!(report.has_code("unexpected-semantic-projection"));
+}
+
+#[test]
+fn architecture_scope_is_emitted_and_verified_exactly() {
+    let temp = TempDir::new().unwrap();
+    let mut snapshot = snapshot();
+    let scope = ArchitectureScope {
+        evidence_total: 3,
+        evidence_supplied: 1,
+        coverage_items_total: 2,
+        coverage_items_supplied: 1,
+        entities_total: 4,
+        entities_supplied: 2,
+        semantic_references_total: 3,
+        semantic_references_supplied: 1,
+        semantic_relationships_total: 2,
+        semantic_relationships_supplied: 1,
+        complete: false,
+    };
+    snapshot.documents[0].metadata.status = Some(OkfStatus::Draft);
+    snapshot.documents[0].metadata.generated = Some(Generated {
+        by: "repo2okf-agent/codex".to_owned(),
+        at: None,
+    });
+    snapshot.documents[0].metadata.repo2okf = Some(Repo2OkfMetadata {
+        claims: Vec::new(),
+        relationships: Vec::new(),
+        architecture: Some(OkfArchitectureConcept {
+            source_concept_id: "architecture:auth".to_owned(),
+            member_entity_ids: vec!["caller".to_owned(), "callee".to_owned()],
+            supporting_relationship_ids: vec!["edge-support".to_owned()],
+            evidence_ids: vec!["ev-auth".to_owned()],
+            scope: Some(scope.clone()),
+        }),
+    });
+    snapshot.semantic_inventory = Some(SemanticInventory {
+        entity_ids: vec!["caller".to_owned(), "callee".to_owned()],
+        relationship_ids: vec!["edge-support".to_owned()],
+        resolved_reference_ids: Vec::new(),
+        architecture_concept_ids: vec!["architecture:auth".to_owned()],
+        projection_contract_complete: true,
+        projected_relationships: Vec::new(),
+        architecture_scope: Some(scope),
+    });
+
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let path = temp.path().join("modules/auth.md");
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("scope:\n"));
+    assert!(contents.contains("complete: false"));
+    fs::write(
+        &path,
+        contents.replacen("complete: false", "complete: true", 1),
+    )
+    .unwrap();
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &VerifyOptions {
+            semantic_inventory: snapshot.semantic_inventory.clone(),
+            ..VerifyOptions::default()
+        },
+    );
+    assert!(report.has_code("architecture-scope-mismatch"));
+}
+
+#[test]
+fn rejects_dangling_or_unresolved_semantic_relationship_provenance() {
+    let temp = TempDir::new().unwrap();
+    let mut snapshot = snapshot();
+    let mut data = document("modules/data", "ev-data");
+    data.claims[0].id = "validates-data".to_owned();
+    snapshot.documents.push(data);
+    snapshot
+        .evidence
+        .push(evidence("ev-data", "src/data.rs", "blake3:data"));
+    snapshot.coverage.push(CoverageItem {
+        id: "file:src/data.rs".to_owned(),
+        classification: CoverageClassification::Included {
+            concept_id: "modules/data".to_owned(),
+        },
+    });
+    snapshot.semantic_inventory = Some(SemanticInventory {
+        entity_ids: Vec::new(),
+        relationship_ids: vec!["edge-known".to_owned()],
+        resolved_reference_ids: vec!["ref-resolved".to_owned()],
+        architecture_concept_ids: Vec::new(),
+        projection_contract_complete: false,
+        projected_relationships: Vec::new(),
+        architecture_scope: None,
+    });
+    snapshot.documents[0].relationships.push(OkfRelationship {
+        target: "modules/data".to_owned(),
+        label: None,
+        kind: Some("calls".to_owned()),
+        source_relationship_ids: vec!["edge-missing".to_owned()],
+        origin_reference_ids: vec!["ref-unresolved".to_owned()],
+        evidence_ids: vec!["ev-auth".to_owned()],
+    });
+
+    assert!(matches!(
+        emit_okf(&snapshot, temp.path()).unwrap_err(),
+        EmitError::UnknownGraphRelationship { .. }
+    ));
+    snapshot.documents[0].relationships[0].source_relationship_ids = vec!["edge-known".to_owned()];
+    assert!(matches!(
+        emit_okf(&snapshot, temp.path()).unwrap_err(),
+        EmitError::UnknownResolvedReference { .. }
+    ));
+}
+
+#[test]
+fn keeps_plain_hand_authored_relationships_backward_compatible() {
+    let temp = TempDir::new().unwrap();
+    let mut snapshot = snapshot();
+    let mut data = document("modules/data", "ev-data");
+    data.claims[0].id = "validates-data".to_owned();
+    snapshot.documents.push(data);
+    snapshot
+        .evidence
+        .push(evidence("ev-data", "src/data.rs", "blake3:data"));
+    snapshot.coverage.push(CoverageItem {
+        id: "file:src/data.rs".to_owned(),
+        classification: CoverageClassification::Included {
+            concept_id: "modules/data".to_owned(),
+        },
+    });
+    snapshot.documents[0].relationships.push(OkfRelationship {
+        target: "modules/data".to_owned(),
+        label: None,
+        kind: Some("calls".to_owned()),
+        source_relationship_ids: Vec::new(),
+        origin_reference_ids: Vec::new(),
+        evidence_ids: Vec::new(),
+    });
+
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &VerifyOptions::default(),
+    );
+    assert!(report.valid, "{:#?}", report.issues);
+}
+
+#[test]
+fn verifier_detects_semantic_metadata_tampering() {
+    let temp = TempDir::new().unwrap();
+    write_bundle(
+        temp.path(),
+        "auth.md",
+        concat!(
+            "---\n",
+            "type: Module\n",
+            "sources:\n",
+            "  - resource: repo:src/auth.rs#L7\n",
+            "    evidence_id: ev-auth\n",
+            "    content_hash: blake3:auth\n",
+            "repo2okf:\n",
+            "  relationships:\n",
+            "    - target: data\n",
+            "      kind: calls\n",
+            "      source_relationship_ids: [edge-forged]\n",
+            "      origin_reference_ids: [ref-unresolved]\n",
+            "      evidence_ids: [ev-auth]\n",
+            "---\n\n",
+            "[data](/data.md)\n",
+        ),
+    );
+    fs::write(temp.path().join("data.md"), "---\ntype: Module\n---\n").unwrap();
+    let options = VerifyOptions {
+        semantic_inventory: Some(SemanticInventory {
+            entity_ids: Vec::new(),
+            relationship_ids: vec!["edge-call".to_owned()],
+            resolved_reference_ids: vec!["ref-call".to_owned()],
+            architecture_concept_ids: Vec::new(),
+            projection_contract_complete: true,
+            projected_relationships: vec![ProjectedSemanticRelationship {
+                source_concept_id: "auth".to_owned(),
+                target_concept_id: "data".to_owned(),
+                kind: "calls".to_owned(),
+                source_relationship_ids: vec!["edge-call".to_owned()],
+                origin_reference_ids: vec!["ref-call".to_owned()],
+                evidence_ids: vec!["ev-auth".to_owned()],
+            }],
+            architecture_scope: None,
+        }),
+        ..VerifyOptions::default()
+    };
+    let report = verify_okf(
+        temp.path(),
+        &[evidence("ev-auth", "src/auth.rs", "blake3:auth")],
+        &[],
+        &options,
+    );
+    assert!(report.has_code("unknown-graph-relationship"));
+    assert!(report.has_code("non-resolved-relationship-origin"));
 }
 
 #[test]

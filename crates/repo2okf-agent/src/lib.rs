@@ -13,12 +13,14 @@ mod process;
 pub use driver::{AgentDriver, ClaudeDriver, CodexDriver};
 pub use loop_engine::{RepairOptions, enrich_with_repair, validate_response};
 pub use model::{
-    AgentCapabilities, AgentKind, AgentProbe, EnrichmentRequest, EnrichmentResponse,
-    EnrichmentStats, EvidenceExcerpt, ValidationIssue,
+    AcceptedConceptCandidate, AcceptedRelationshipCandidate, AgentCapabilities, AgentKind,
+    AgentProbe, CandidateRelationshipKind, ConceptCandidate, EnrichmentRequest, EnrichmentResponse,
+    EnrichmentStats, EvidenceExcerpt, RelationshipCandidate, SemanticGraphScope,
+    SuppliedSemanticGraph, ValidationIssue,
 };
 pub use process::{AgentError, ProcessConfig};
 
 /// Revision of the vendor prompt, schema, and process-isolation contract.
 ///
 /// Incremental consumers should include this value in build fingerprints.
-pub const AGENT_CONTRACT_VERSION: &str = "5";
+pub const AGENT_CONTRACT_VERSION: &str = "8";

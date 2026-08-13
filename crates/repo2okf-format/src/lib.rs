@@ -12,9 +12,10 @@ mod verify;
 
 pub use emit::{EmissionReport, EmitError, emit_okf};
 pub use model::{
-    CoverageClassification, CoverageItem, DocumentPathError, EvidenceRecord, Generated,
-    OKF_VERSION, OkfBundle, OkfClaim, OkfDocument, OkfMetadata, OkfRelationship, OkfSource,
-    OkfStatus, Repo2OkfMetadata, RepositoryIrView, RepositorySnapshot, UsageWindow, Verification,
+    ArchitectureScope, CoverageClassification, CoverageItem, DocumentPathError, EvidenceRecord,
+    Generated, OKF_VERSION, OkfArchitectureConcept, OkfBundle, OkfClaim, OkfDocument, OkfMetadata,
+    OkfRelationship, OkfSource, OkfStatus, ProjectedSemanticRelationship, Repo2OkfMetadata,
+    RepositoryIrView, RepositorySnapshot, SemanticInventory, UsageWindow, Verification,
     concept_path,
 };
 pub use verify::{

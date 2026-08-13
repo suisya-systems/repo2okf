@@ -196,8 +196,8 @@ That flag is an explicit trust decision: never reuse generated state from an
 untrusted checkout. See the [security model] for the complete boundary.
 
 When a reviewer runs, deterministic scanner claims are retained, primary-agent
-claims are removed, and the accepted reviewer claims become the semantic
-claims in the published IR.
+claims and architecture drafts are replaced, and only the reviewer's accepted
+claims and always-draft architecture interpretation are published.
 
 ## `verify`
 
@@ -229,6 +229,17 @@ Reports included, excluded, and unresolved inventory from the saved IR. It does
 not rescan the repository, so it describes the last successful `scan`,
 `compile`, or `update` rather than necessarily describing current source.
 
+The text report also shows semantic-reference totals split into resolved,
+external, ambiguous, and unresolved. JSON retains the source-coverage fields at
+the top level and adds a `semantic` object with those totals. Semantic coverage
+accounts for conservative resolution; unresolved dynamic behavior is visible
+but does not by itself make strict verification fail.
+
+After agent enrichment, the report also includes `architecture_scope`: the
+host-computed supplied/total evidence and semantic-graph counts plus whether the
+agent saw the complete bounded input. This prevents a partial draft from being
+mistaken for a repository-wide interpretation.
+
 | Option | Meaning |
 | --- | --- |
 | `--json` | Emit the saved coverage object as stable JSON. |
@@ -247,7 +258,7 @@ is equivalent for command-specific help.
 | Path | Produced by | Contents |
 | --- | --- | --- |
 | `repo2okf.toml` | `init` | Repository configuration. |
-| `.repo2okf/ir.json` | `scan`, `compile`, `update` | Repository IR plus any accepted agent claims. |
+| `.repo2okf/ir.json` | `scan`, `compile`, `update` | Repository IR, semantic graph and any accepted agent claims/draft architecture concepts. |
 | `.repo2okf/state.json` | `scan`, `compile`, `update` | Fingerprints used by verification and update decisions. |
 | `.okf/index.md` and concept documents | `compile`, `update` | Generated OKF v0.2 index and concepts. |
 | `.okf/.repo2okf-owned` and `.repo2okf/.repo2okf-owned` | `compile`, `update`; cache marker also by `scan` | Ownership markers used to guard whole-directory replacement. |

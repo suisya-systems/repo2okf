@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -17,6 +17,94 @@ fn repo2okf(repository: &Path, arguments: &[&str]) -> Output {
         .args(arguments)
         .output()
         .expect("repo2okf process should start")
+}
+
+fn repo2okf_with_fake_bin(repository: &Path, arguments: &[&str], fake_bin: &Path) -> Output {
+    #[cfg(unix)]
+    let search_path = env::join_paths([fake_bin]).expect("fake Unix PATH");
+    #[cfg(windows)]
+    let search_path = {
+        let system_root = env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .expect("Windows has SystemRoot");
+        env::join_paths([fake_bin.to_path_buf(), system_root.join("System32")])
+            .expect("fake Windows PATH")
+    };
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_repo2okf"));
+    command
+        .arg("--repository")
+        .arg(repository)
+        .args(arguments)
+        .env("PATH", search_path);
+    #[cfg(windows)]
+    command.env("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+    command.output().expect("repo2okf process should start")
+}
+
+#[cfg(unix)]
+fn write_fake_claude(fake_bin: &Path, response: &Value) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir(fake_bin).expect("create fake agent bin");
+    let response = serde_json::to_string(response)
+        .expect("serialize fake Claude response")
+        .replace('\'', "'\"'\"'");
+    let executable = fake_bin.join("claude");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
+  printf '%s\n' 'claude-code 9.9.9'
+  exit 0
+fi
+if [ "$#" -eq 1 ] && [ "$1" = "--help" ]; then
+  printf '%s\n' '--print -p stream-json --json-schema --tools --disallowedTools --safe-mode'
+  exit 0
+fi
+if [ "$#" -eq 2 ] && [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{{"loggedIn":true}}'
+  exit 0
+fi
+printf '%s' '{response}'
+"#
+    );
+    fs::write(&executable, script).expect("write fake Claude executable");
+    let mut permissions = fs::metadata(&executable)
+        .expect("fake Claude metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(executable, permissions).expect("make fake Claude executable");
+}
+
+#[cfg(windows)]
+fn write_fake_claude(fake_bin: &Path, response: &Value) {
+    fs::create_dir(fake_bin).expect("create fake agent bin");
+    fs::write(
+        fake_bin.join("response.json"),
+        serde_json::to_vec(response).expect("serialize fake Claude response"),
+    )
+    .expect("write fake Claude response");
+    fs::write(
+        fake_bin.join("claude.cmd"),
+        concat!(
+            "@echo off\r\n",
+            "if \"%~1\"==\"--version\" goto version\r\n",
+            "if \"%~1\"==\"--help\" goto help\r\n",
+            "if \"%~1\"==\"auth\" goto auth\r\n",
+            "type \"%~dp0response.json\"\r\n",
+            "exit /b 0\r\n",
+            ":version\r\n",
+            "echo claude-code 9.9.9\r\n",
+            "exit /b 0\r\n",
+            ":help\r\n",
+            "echo --print -p stream-json --json-schema --tools --disallowedTools --safe-mode\r\n",
+            "exit /b 0\r\n",
+            ":auth\r\n",
+            "echo {\"loggedIn\":true}\r\n",
+            "exit /b 0\r\n",
+        ),
+    )
+    .expect("write fake Claude executable");
 }
 
 fn assert_success(output: &Output, context: &str) {
@@ -178,6 +266,7 @@ fn facts_only_compile_verify_coverage_and_incremental_update() {
     let coverage: Value =
         serde_json::from_slice(&coverage.stdout).expect("coverage should emit JSON");
     assert!(coverage["included"].as_u64().unwrap_or_default() > 0);
+    assert!(coverage["semantic"].is_object());
     assert!(
         coverage["items"]
             .as_array()
@@ -321,21 +410,27 @@ fn scan_replaces_the_whole_owned_cache() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one black-box scenario follows semantic evidence from source through IR and OKF"
+)]
 fn starter_config_compiles_a_small_python_repository() {
     let fixture = tempfile::tempdir().expect("temporary repository");
     fs::create_dir(fixture.path().join("example")).expect("create Python package");
+    fs::write(fixture.path().join("example/__init__.py"), "")
+        .expect("write Python package fixture");
     fs::write(
         fixture.path().join("example/helpers.py"),
         "def greet(name: str) -> str:\n    return f'hello {name}'\n",
     )
     .expect("write Python helper fixture");
     let service_source = concat!(
-        "from .helpers import greet\n\n",
+        "from .helpers import greet as friendly_greet\n\n",
         "class Greeter:\n",
         "    \"\"\"Format a friendly welcome without side effects.\"\"\"\n",
         "    def welcome(self, name: str) -> str:\n",
         "        \"\"\"Return a greeting for the supplied name.\"\"\"\n",
-        "        return greet(name)\n",
+        "        return friendly_greet(name)\n",
     );
     fs::write(fixture.path().join("example/service.py"), service_source)
         .expect("write Python service fixture");
@@ -351,17 +446,28 @@ fn starter_config_compiles_a_small_python_repository() {
         &fs::read(fixture.path().join(".repo2okf/ir.json")).expect("read generated IR"),
     )
     .expect("valid IR JSON");
-    assert!(ir["entities"].as_array().is_some_and(|entities| {
-        ["greet", "Greeter", "welcome"]
-            .iter()
-            .all(|expected| entities.iter().any(|entity| entity["name"] == *expected))
-    }));
+    let entities = ir["entities"].as_array().expect("IR entities");
+    let greet = entities
+        .iter()
+        .find(|entity| entity["name"] == "greet")
+        .expect("greet entity");
+    let greeter = entities
+        .iter()
+        .find(|entity| entity["name"] == "Greeter")
+        .expect("Greeter entity");
+    let welcome = entities
+        .iter()
+        .find(|entity| entity["name"] == "welcome")
+        .expect("welcome entity");
+    assert_eq!(greet["qualified_name"], "example.helpers.greet");
+    assert_eq!(greeter["qualified_name"], "example.service.Greeter");
+    assert_eq!(welcome["qualified_name"], "example.service.Greeter.welcome");
+    assert_eq!(welcome["owner_id"], greeter["id"]);
     assert!(ir["imports"].as_array().is_some_and(|imports| {
         imports.iter().any(|import| {
             import["path"] == "example/service.py" && import["specifier"] == ".helpers"
         })
     }));
-    let entities = ir["entities"].as_array().expect("IR entities");
     let service = entities
         .iter()
         .find(|entity| entity["kind"] == "file" && entity["path"] == "example/service.py")
@@ -379,7 +485,210 @@ fn starter_config_compiles_a_small_python_repository() {
                 && relationship["target"] == helpers
         })
     }));
+
+    let semantic_references = ir["semantic_references"]
+        .as_array()
+        .expect("semantic references");
+    let import_binding = semantic_references
+        .iter()
+        .find(|reference| {
+            reference["kind"] == "import_binding"
+                && reference["path"] == "example/service.py"
+                && reference["name"] == "greet"
+                && reference["qualifier"] == ".helpers"
+                && reference["binding_name"] == "friendly_greet"
+        })
+        .expect("aliased local import binding");
+    assert_eq!(import_binding["resolution"]["status"], "resolved");
+    assert_eq!(
+        import_binding["resolution"]["target_entity_id"],
+        greet["id"]
+    );
+
+    let direct_call = semantic_references
+        .iter()
+        .find(|reference| {
+            reference["kind"] == "call"
+                && reference["path"] == "example/service.py"
+                && reference["name"] == "friendly_greet"
+        })
+        .expect("direct call through imported alias");
+    assert_eq!(direct_call["scope_id"], welcome["id"]);
+    assert_eq!(direct_call["source_entity_id"], welcome["id"]);
+    assert_eq!(direct_call["resolution"]["status"], "resolved");
+    assert_eq!(direct_call["resolution"]["target_entity_id"], greet["id"]);
+
+    let semantic_coverage = &ir["semantic_coverage"];
+    let classified = ["resolved", "external", "ambiguous", "unresolved"]
+        .iter()
+        .map(|field| semantic_coverage[*field].as_u64().expect("semantic count"))
+        .sum::<u64>();
+    assert_eq!(
+        semantic_coverage["total"].as_u64(),
+        Some(u64::try_from(semantic_references.len()).expect("reference count fits u64"))
+    );
+    assert_eq!(semantic_coverage["total"].as_u64(), Some(classified));
+
+    let coverage_items = ir["coverage"]["items"]
+        .as_array()
+        .expect("source coverage items");
+    let file_concept_ids = coverage_items
+        .iter()
+        .filter(|item| item["kind"] == "file" && item["disposition"]["status"] == "included")
+        .filter_map(|item| item["disposition"]["concept_id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(file_concept_ids.len(), 3);
+    let entity_coverage = coverage_items
+        .iter()
+        .filter(|item| item["kind"] == "entity")
+        .collect::<Vec<_>>();
+    assert_eq!(entity_coverage.len(), 3);
+    assert!(entity_coverage.iter().all(|item| {
+        item["disposition"]["status"] == "included"
+            && item["disposition"]["concept_id"]
+                .as_str()
+                .is_some_and(|concept_id| file_concept_ids.contains(&concept_id))
+    }));
+
+    let direct_call_relationship = ir["relationships"]
+        .as_array()
+        .and_then(|relationships| {
+            relationships.iter().find(|relationship| {
+                relationship["kind"] == "calls"
+                    && relationship["source"] == welcome["id"]
+                    && relationship["target"] == greet["id"]
+                    && relationship["origin"]["kind"] == "semantic_reference"
+                    && relationship["origin"]["reference_id"] == direct_call["id"]
+            })
+        })
+        .expect("resolved call relationship");
+    assert_eq!(
+        direct_call_relationship["evidence_ids"],
+        Value::Array(vec![direct_call["evidence_id"].clone()])
+    );
+    let call_evidence = ir["evidence"]
+        .as_array()
+        .and_then(|evidence| {
+            evidence
+                .iter()
+                .find(|evidence| evidence["id"] == direct_call["evidence_id"])
+        })
+        .expect("call evidence record");
+    assert_eq!(call_evidence["path"], "example/service.py");
+    let call_start = usize::try_from(call_evidence["start_byte"].as_u64().expect("start byte"))
+        .expect("start byte fits usize");
+    let call_end = usize::try_from(call_evidence["end_byte"].as_u64().expect("end byte"))
+        .expect("end byte fits usize");
+    assert_eq!(
+        &service_source.as_bytes()[call_start..call_end],
+        b"friendly_greet"
+    );
+
     let claims = ir["claims"].as_array().expect("IR claims");
+    assert!(
+        claims
+            .iter()
+            .all(|claim| claim["provenance"]["kind"] == "deterministic"),
+        "facts-only must not persist agent provenance"
+    );
+    assert!(
+        ir["architecture_concepts"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+    assert!(
+        ir["architecture_relationships"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+
+    let okf_root = fixture.path().join(".okf");
+    let concepts = bundle_bytes(&okf_root)
+        .into_iter()
+        .filter(|(path, _)| {
+            path.extension().is_some_and(|extension| extension == "md")
+                && path != Path::new("index.md")
+        })
+        .map(|(path, bytes)| {
+            (
+                path,
+                String::from_utf8(bytes).expect("generated concept should be UTF-8"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        concepts.len(),
+        6,
+        "three source files, one package and two logical modules are expected"
+    );
+    assert_eq!(
+        concepts
+            .iter()
+            .filter(|(_, contents)| contents.contains("type: Source File\n"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        concepts
+            .iter()
+            .filter(|(_, contents)| contents.contains("type: Python Module\n"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        concepts
+            .iter()
+            .filter(|(_, contents)| contents.contains("type: Python Package\n"))
+            .count(),
+        1
+    );
+    assert!(concepts.iter().all(|(_, contents)| {
+        !contents.contains("type: Source Declaration\n") && !contents.contains("type: Import\n")
+    }));
+    assert!(concepts.iter().any(|(_, contents)| {
+        contents.contains("type: Python Package\n") && contents.contains("repo:example/__init__.py")
+    }));
+    assert!(concepts.iter().all(|(_, contents)| {
+        !contents.contains("repo2okf-agent/")
+            && !contents.contains("agent_provider:")
+            && !contents.contains("ai_generated: true")
+    }));
+    let (helper_concept_path, _) = concepts
+        .iter()
+        .find(|(_, contents)| {
+            contents.contains("type: Python Module\n")
+                && contents.contains("repo:example/helpers.py")
+        })
+        .expect("helper module concept");
+    let (_, service_concept) = concepts
+        .iter()
+        .find(|(_, contents)| {
+            contents.contains("type: Python Module\n")
+                && contents.contains("repo:example/service.py")
+        })
+        .expect("service module concept");
+    let helper_link = helper_concept_path.to_string_lossy().replace('\\', "/");
+    assert!(service_concept.contains(&format!("](/{helper_link})")));
+    for retained_id in [
+        direct_call_relationship["id"]
+            .as_str()
+            .expect("relationship ID"),
+        direct_call["id"].as_str().expect("reference ID"),
+        direct_call["evidence_id"].as_str().expect("evidence ID"),
+    ] {
+        assert!(
+            service_concept.contains(retained_id),
+            "cross-concept call must retain {retained_id}"
+        );
+    }
+    assert!(service_concept.contains("kind: calls"));
+
+    let coverage = repo2okf(fixture.path(), &["coverage", "--json"]);
+    assert_success(&coverage, "Python semantic coverage report");
+    let coverage: Value =
+        serde_json::from_slice(&coverage.stdout).expect("coverage should emit JSON");
+    assert_eq!(coverage["semantic"], ir["semantic_coverage"]);
+
     let docstring_claim = claims
         .iter()
         .find(|claim| {
@@ -421,4 +730,238 @@ fn starter_config_compiles_a_small_python_repository() {
             .as_str()
             .is_some_and(|text| text.contains("Return a greeting for the supplied name."))
     }));
+
+    fs::write(
+        fixture.path().join("example/service.py"),
+        service_source.replace(
+            "return friendly_greet(name)",
+            "return friendly_greet(name.upper())",
+        ),
+    )
+    .expect("change a source occurrence cited by the call relationship");
+    let stale = repo2okf(fixture.path(), &["verify", "--json"]);
+    assert!(
+        !stale.status.success(),
+        "changing cited semantic source must stale the saved OKF"
+    );
+    let stale_report: Value =
+        serde_json::from_slice(&stale.stdout).expect("stale verification should emit JSON");
+    assert_eq!(stale_report["valid"], false);
+    assert!(stale_report["issues"].as_array().is_some_and(|issues| {
+        issues
+            .iter()
+            .any(|issue| issue["code"] == "repository-ir-stale")
+    }));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one process-boundary scenario follows an accepted agent candidate into persisted OKF"
+)]
+fn fake_claude_candidate_becomes_a_scoped_draft_okf_concept() {
+    let fixture = tempfile::tempdir().expect("temporary repository");
+    let root = fixture.path();
+    fs::create_dir(root.join("example")).expect("create Python package");
+    fs::write(root.join("example/__init__.py"), "").expect("write Python package fixture");
+    fs::write(
+        root.join("example/helpers.py"),
+        "def greet(name: str) -> str:\n    return f'hello {name}'\n",
+    )
+    .expect("write helper fixture");
+    fs::write(
+        root.join("example/service.py"),
+        concat!(
+            "from .helpers import greet as friendly_greet\n\n",
+            "def welcome(name: str) -> str:\n",
+            "    return friendly_greet(name)\n",
+        ),
+    )
+    .expect("write service fixture");
+
+    assert_success(&repo2okf(root, &["scan"]), "seed deterministic IR");
+    let seed_ir: Value =
+        serde_json::from_slice(&fs::read(root.join(".repo2okf/ir.json")).expect("seed IR bytes"))
+            .expect("valid seed IR");
+    let entities = seed_ir["entities"].as_array().expect("seed entities");
+    let greet_id = entities
+        .iter()
+        .find(|entity| entity["qualified_name"] == "example.helpers.greet")
+        .and_then(|entity| entity["id"].as_str())
+        .expect("greet entity")
+        .to_owned();
+    let welcome_id = entities
+        .iter()
+        .find(|entity| entity["qualified_name"] == "example.service.welcome")
+        .and_then(|entity| entity["id"].as_str())
+        .expect("welcome entity")
+        .to_owned();
+    let greet_evidence_id = entities
+        .iter()
+        .find(|entity| entity["qualified_name"] == "example.helpers.greet")
+        .and_then(|entity| entity["evidence_id"].as_str())
+        .expect("greet declaration evidence")
+        .to_owned();
+    let welcome_evidence_id = entities
+        .iter()
+        .find(|entity| entity["qualified_name"] == "example.service.welcome")
+        .and_then(|entity| entity["evidence_id"].as_str())
+        .expect("welcome declaration evidence")
+        .to_owned();
+    let call = seed_ir["relationships"]
+        .as_array()
+        .and_then(|relationships| {
+            relationships.iter().find(|relationship| {
+                relationship["kind"] == "calls"
+                    && relationship["source"] == welcome_id
+                    && relationship["target"] == greet_id
+                    && relationship["origin"]["kind"] == "semantic_reference"
+            })
+        })
+        .expect("resolved semantic call");
+    let call_id = call["id"]
+        .as_str()
+        .expect("call relationship ID")
+        .to_owned();
+    let call_evidence_id = call["evidence_ids"]
+        .as_array()
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .expect("call evidence ID")
+        .to_owned();
+    let mut concept_evidence_ids = vec![
+        call_evidence_id.clone(),
+        greet_evidence_id,
+        welcome_evidence_id,
+    ];
+    concept_evidence_ids.sort();
+    concept_evidence_ids.dedup();
+
+    let response = serde_json::json!({
+        "type": "result",
+        "structured_output": {
+            "claims": [],
+            "repository_summary": null,
+            "summary_evidence_ids": [],
+            "concept_candidates": [{
+                "candidate_key": "greeting-flow",
+                "title": "Greeting flow",
+                "responsibility": "Connects the greeting entry point to its local helper.",
+                "member_entity_ids": [welcome_id, greet_id],
+                "supporting_edge_ids": [call_id],
+                "evidence_ids": concept_evidence_ids.clone()
+            }],
+            "relationship_candidates": []
+        }
+    });
+    let fake_agent = tempfile::tempdir().expect("fake agent directory");
+    let fake_bin = fake_agent.path().join("bin");
+    write_fake_claude(&fake_bin, &response);
+    let compile = repo2okf_with_fake_bin(root, &["compile", "--agent", "claude"], &fake_bin);
+    assert_success(&compile, "compile through fake Claude process boundary");
+    assert!(stdout(&compile).contains("claude enrichment accepted after 1 attempt(s)"));
+
+    let ir: Value = serde_json::from_slice(
+        &fs::read(root.join(".repo2okf/ir.json")).expect("agent-enriched IR bytes"),
+    )
+    .expect("valid agent-enriched IR");
+    let architecture = ir["architecture_concepts"]
+        .as_array()
+        .and_then(|concepts| concepts.first())
+        .expect("accepted architecture concept");
+    assert_eq!(
+        ir["architecture_concepts"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(architecture["title"], "Greeting flow");
+    assert_eq!(architecture["status"], "draft");
+    assert_eq!(architecture["provenance"]["kind"], "agent");
+    assert_eq!(architecture["provenance"]["provider"], "claude");
+    assert_ne!(architecture["id"], "greeting-flow");
+    let members = architecture["member_entity_ids"]
+        .as_array()
+        .expect("architecture members");
+    assert!(members.iter().any(|member| member == &welcome_id));
+    assert!(members.iter().any(|member| member == &greet_id));
+    assert!(
+        architecture["supporting_relationship_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.len() == 1 && ids[0] == call_id)
+    );
+    assert_eq!(
+        architecture["evidence_ids"],
+        serde_json::to_value(&concept_evidence_ids).expect("candidate evidence JSON")
+    );
+    assert!(
+        ir["architecture_relationships"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+
+    let scope = &ir["architecture_scope"];
+    assert_eq!(scope["complete"], true);
+    for (supplied, total) in [
+        ("evidence_supplied", "evidence_total"),
+        ("coverage_items_supplied", "coverage_items_total"),
+        ("entities_supplied", "entities_total"),
+        ("semantic_references_supplied", "semantic_references_total"),
+        (
+            "semantic_relationships_supplied",
+            "semantic_relationships_total",
+        ),
+    ] {
+        assert_eq!(scope[supplied], scope[total], "incomplete {total}");
+        assert!(scope[total].as_u64().is_some_and(|count| count > 0));
+    }
+
+    let coverage_json = repo2okf(root, &["coverage", "--json"]);
+    assert_success(&coverage_json, "scoped JSON coverage");
+    let coverage_json: Value =
+        serde_json::from_slice(&coverage_json.stdout).expect("coverage JSON");
+    assert_eq!(
+        coverage_json["architecture_scope"],
+        ir["architecture_scope"]
+    );
+    let coverage_text = repo2okf(root, &["coverage"]);
+    assert_success(&coverage_text, "scoped text coverage");
+    let coverage_text = stdout(&coverage_text);
+    assert!(coverage_text.contains("architecture input: complete"));
+    for label in [
+        "evidence:",
+        "coverage items:",
+        "entities:",
+        "references:",
+        "relationships:",
+    ] {
+        assert!(coverage_text.contains(label), "missing scope label {label}");
+    }
+
+    let architecture_documents = bundle_bytes(&root.join(".okf"))
+        .into_values()
+        .filter_map(|bytes| String::from_utf8(bytes).ok())
+        .filter(|contents| contents.contains("type: Architecture Component\n"))
+        .collect::<Vec<_>>();
+    assert_eq!(architecture_documents.len(), 1);
+    let document = &architecture_documents[0];
+    assert!(document.contains("status: draft"));
+    assert!(document.contains("repo2okf-agent/claude"));
+    assert!(!document.contains("verified:"));
+    for retained_id in [
+        architecture["id"].as_str().expect("architecture ID"),
+        welcome_id.as_str(),
+        greet_id.as_str(),
+        call_id.as_str(),
+        call_evidence_id.as_str(),
+    ] {
+        assert!(
+            document.contains(retained_id),
+            "draft architecture document must retain {retained_id}"
+        );
+    }
+    assert!(document.contains("complete: true"));
+
+    let verify = repo2okf(root, &["verify", "--json"]);
+    assert_success(&verify, "verify agent draft bundle");
+    let verification: Value = serde_json::from_slice(&verify.stdout).expect("verification JSON");
+    assert_eq!(verification["valid"], true);
 }
