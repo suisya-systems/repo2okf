@@ -471,10 +471,10 @@ const fn relative_import_failure_reason(failure: RelativeImportFailure) -> &'sta
 }
 
 fn discover_files(root: &Path, options: &ScanOptions) -> Result<(Vec<PathBuf>, bool), ScanError> {
-    if options.prefer_git {
-        if let Some(paths) = git_files(root, options)? {
-            return Ok((paths, true));
-        }
+    if options.prefer_git
+        && let Some(paths) = git_files(root, options)?
+    {
+        return Ok((paths, true));
     }
     let mut builder = WalkBuilder::new(root);
     let filter_root = root.to_path_buf();
@@ -1329,25 +1329,24 @@ fn walk_syntax(
     symbols: &mut Vec<ParsedSymbol>,
     imports: &mut Vec<ParsedImport>,
 ) {
-    if let Some(kind) = entity_kind_for_node(node, language) {
-        if let Some(name_node) = name_node(node, language) {
-            if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
-                let name = name.trim();
-                if !name.is_empty() {
-                    let span_node = declaration_span_node(node, language);
-                    symbols.push(ParsedSymbol {
-                        kind,
-                        name: name.to_owned(),
-                        start_byte: span_node.start_byte(),
-                        end_byte: span_node.end_byte(),
-                        start_line: one_based_row(span_node.start_position().row),
-                        end_line: one_based_row(span_node.end_position().row),
-                        docstring: (language == Language::Python)
-                            .then(|| python_docstring_span(node, source))
-                            .flatten(),
-                    });
-                }
-            }
+    if let Some(kind) = entity_kind_for_node(node, language)
+        && let Some(name_node) = name_node(node, language)
+        && let Ok(name) = name_node.utf8_text(source.as_bytes())
+    {
+        let name = name.trim();
+        if !name.is_empty() {
+            let span_node = declaration_span_node(node, language);
+            symbols.push(ParsedSymbol {
+                kind,
+                name: name.to_owned(),
+                start_byte: span_node.start_byte(),
+                end_byte: span_node.end_byte(),
+                start_line: one_based_row(span_node.start_position().row),
+                end_line: one_based_row(span_node.end_position().row),
+                docstring: (language == Language::Python)
+                    .then(|| python_docstring_span(node, source))
+                    .flatten(),
+            });
         }
     }
 

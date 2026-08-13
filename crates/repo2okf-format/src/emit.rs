@@ -391,17 +391,17 @@ fn validate_metadata(document: &OkfDocument) -> Result<(), EmitError> {
                 source.id.as_deref().unwrap_or(&source.resource)
             )));
         }
-        if let Some(id) = source.id.as_deref() {
-            if !safe_footnote_id(id) || !source_ids.insert(id) {
-                return Err(invalid(format!("source ID `{id}` is empty or duplicated")));
-            }
+        if let Some(id) = source.id.as_deref()
+            && (!safe_footnote_id(id) || !source_ids.insert(id))
+        {
+            return Err(invalid(format!("source ID `{id}` is empty or duplicated")));
         }
-        if let Some(evidence_id) = source.evidence_id.as_deref() {
-            if !source_evidence.insert(evidence_id) {
-                return Err(invalid(format!(
-                    "evidence `{evidence_id}` occurs in multiple sources"
-                )));
-            }
+        if let Some(evidence_id) = source.evidence_id.as_deref()
+            && !source_evidence.insert(evidence_id)
+        {
+            return Err(invalid(format!(
+                "evidence `{evidence_id}` occurs in multiple sources"
+            )));
         }
         if source
             .usage_window

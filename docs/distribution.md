@@ -22,7 +22,7 @@ archives. GitHub artifact attestations are enabled in `dist-workspace.toml`.
 ## Install from a checkout
 
 Until the first hosted release is published, install directly from a checkout
-with Rust 1.85 or newer:
+with Rust 1.88 or newer:
 
 ```console
 cargo install --path crates/repo2okf-cli --locked

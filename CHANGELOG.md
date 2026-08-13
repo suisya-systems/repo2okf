@@ -23,3 +23,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Compiler-owned bundle/IR/state integrity checks and staged publication.
 - Root/file identity revalidation and rollback-safe bundle/cache publication.
 - OKF v0.2 emission and verification.
+
+### Changed
+
+- Updated Tree-sitter, language grammars, TOML parsing and repository walking
+  dependencies to their current compatible releases.
+- Raised the source-build MSRV to Rust 1.88 and grouped routine Dependabot
+  updates by ecosystem to avoid one pull request per dependency.

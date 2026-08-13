@@ -414,10 +414,10 @@ fn strict_response_schema() -> Result<serde_json::Value, AgentError> {
 fn normalize_response_schema(value: &mut serde_json::Value) -> Result<(), AgentError> {
     match value {
         serde_json::Value::Object(object) => {
-            if let Some(one_of) = object.remove("oneOf") {
-                if object.insert("anyOf".into(), one_of).is_some() {
-                    return Err(schema_error("schema contains both oneOf and anyOf"));
-                }
+            if let Some(one_of) = object.remove("oneOf")
+                && object.insert("anyOf".into(), one_of).is_some()
+            {
+                return Err(schema_error("schema contains both oneOf and anyOf"));
             }
             for keyword in UNSUPPORTED_SCHEMA_KEYWORDS {
                 object.remove(*keyword);

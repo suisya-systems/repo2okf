@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install Rust
@@ -31,16 +31,16 @@ jobs:
       - run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   msrv:
-    name: Rust 1.85
+    name: Rust 1.88
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install minimum supported Rust
-        run: rustup toolchain install 1.85.0 --profile minimal
-      - run: cargo +1.85.0 check --workspace --all-targets --locked
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - run: cargo +1.88.0 check --workspace --all-targets --locked
 
   test:
     name: Test (${{ matrix.os }})
@@ -51,7 +51,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install Rust
@@ -65,7 +65,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install Rust
@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install Rust

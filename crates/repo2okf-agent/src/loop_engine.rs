@@ -319,25 +319,24 @@ fn stamp_agent_provenance(driver: &dyn AgentDriver, response: &mut EnrichmentRes
         };
     }
 
-    if let Some(summary) = response.repository_summary.as_deref().map(str::trim) {
-        if !summary.is_empty()
-            && !response.summary_evidence_ids.is_empty()
-            && !response
-                .claims
-                .iter()
-                .any(|claim| claim.id == "claim:agent:repository-summary")
-        {
-            response.claims.push(repo2okf_core::Claim {
-                id: "claim:agent:repository-summary".into(),
-                text: summary.to_owned(),
-                evidence_ids: response.summary_evidence_ids.clone(),
-                provenance: ClaimProvenance::Agent {
-                    provider,
-                    model: None,
-                },
-                confidence: None,
-            });
-        }
+    if let Some(summary) = response.repository_summary.as_deref().map(str::trim)
+        && !summary.is_empty()
+        && !response.summary_evidence_ids.is_empty()
+        && !response
+            .claims
+            .iter()
+            .any(|claim| claim.id == "claim:agent:repository-summary")
+    {
+        response.claims.push(repo2okf_core::Claim {
+            id: "claim:agent:repository-summary".into(),
+            text: summary.to_owned(),
+            evidence_ids: response.summary_evidence_ids.clone(),
+            provenance: ClaimProvenance::Agent {
+                provider,
+                model: None,
+            },
+            confidence: None,
+        });
     }
 }
 

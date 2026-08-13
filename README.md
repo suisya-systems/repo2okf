@@ -80,7 +80,7 @@ not be reused from an untrusted checkout. The standard CI path is a clean
 
 ## Build from source
 
-Rust 1.85 or newer is required to build the project. End users of release
+Rust 1.88 or newer is required to build the project. End users of release
 binaries do not need Rust, Node.js, or a Python interpreter: Python source is
 parsed directly by the native Repo2OKF binary.
 

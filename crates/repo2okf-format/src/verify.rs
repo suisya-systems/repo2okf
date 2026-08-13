@@ -400,10 +400,10 @@ fn collect_dir(
             );
         } else if file_type.is_dir() {
             collect_dir(root, &path, files, issues);
-        } else if file_type.is_file() {
-            if let Ok(relative) = path.strip_prefix(root) {
-                files.push(relative.to_path_buf());
-            }
+        } else if file_type.is_file()
+            && let Ok(relative) = path.strip_prefix(root)
+        {
+            files.push(relative.to_path_buf());
         }
     }
 }
@@ -805,20 +805,20 @@ fn validate_concepts(
             );
         }
 
-        if let Some(stale_after) = concept.metadata.stale_after {
-            if options.today >= stale_after {
-                issue(
-                    issues,
-                    "stale-document",
-                    if options.stale_documents_are_errors {
-                        Severity::Error
-                    } else {
-                        Severity::Warning
-                    },
-                    document,
-                    format!("concept is stale as of {stale_after}"),
-                );
-            }
+        if let Some(stale_after) = concept.metadata.stale_after
+            && options.today >= stale_after
+        {
+            issue(
+                issues,
+                "stale-document",
+                if options.stale_documents_are_errors {
+                    Severity::Error
+                } else {
+                    Severity::Warning
+                },
+                document,
+                format!("concept is stale as of {stale_after}"),
+            );
         }
     }
 }
@@ -856,15 +856,15 @@ fn validate_sources<'a>(
                 ),
             );
         }
-        if let Some(id) = source.id.as_deref() {
-            if id.trim().is_empty() || !source_ids.insert(id) {
-                error(
-                    issues,
-                    "duplicate-source-id",
-                    document.clone(),
-                    format!("source ID `{id}` is empty or duplicated within the concept"),
-                );
-            }
+        if let Some(id) = source.id.as_deref()
+            && (id.trim().is_empty() || !source_ids.insert(id))
+        {
+            error(
+                issues,
+                "duplicate-source-id",
+                document.clone(),
+                format!("source ID `{id}` is empty or duplicated within the concept"),
+            );
         }
         if source
             .usage_window
@@ -1394,12 +1394,13 @@ fn percent_decode(value: &str) -> String {
     let mut result = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
-                result.push((high << 4) | low);
-                index += 3;
-                continue;
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
+        {
+            result.push((high << 4) | low);
+            index += 3;
+            continue;
         }
         result.push(bytes[index]);
         index += 1;

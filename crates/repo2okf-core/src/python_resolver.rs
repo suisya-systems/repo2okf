@@ -237,10 +237,10 @@ fn python_modules_for_path(path: &str) -> BTreeSet<String> {
     // `src/` is Python's conventional import root. Indexing both spellings is
     // deterministic, and the resolver still requires exactly one target, so a
     // real top-level collision becomes unresolved rather than guessed.
-    if let Some(stripped) = canonical.strip_prefix("src.") {
-        if !stripped.is_empty() {
-            modules.insert(stripped.to_owned());
-        }
+    if let Some(stripped) = canonical.strip_prefix("src.")
+        && !stripped.is_empty()
+    {
+        modules.insert(stripped.to_owned());
     }
     modules
 }
