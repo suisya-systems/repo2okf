@@ -102,6 +102,7 @@ pub enum ScanError {
 #[derive(Debug)]
 struct RootIdentity {
     path: PathBuf,
+    handle: same_file::Handle,
     metadata: fs::Metadata,
 }
 
@@ -114,7 +115,31 @@ impl RootIdentity {
         if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
             return Err(changed_root_error(&path));
         }
-        let identity = Self { path, metadata };
+        let handle = same_file::Handle::from_path(&path).map_err(|source| ScanError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let current = fs::symlink_metadata(&path).map_err(|source| ScanError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let confirmation = same_file::Handle::from_path(&path).map_err(|source| ScanError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if is_link_or_reparse_point(&current)
+            || !current.file_type().is_dir()
+            || handle != confirmation
+            || !same_file_identity(&metadata, &current)
+            || metadata_changed_during_read(&metadata, &current)
+        {
+            return Err(changed_root_error(&path));
+        }
+        let identity = Self {
+            path,
+            handle,
+            metadata: current,
+        };
         identity.verify()?;
         Ok(identity)
     }
@@ -124,8 +149,14 @@ impl RootIdentity {
             path: self.path.clone(),
             source,
         })?;
+        let current_handle =
+            same_file::Handle::from_path(&self.path).map_err(|source| ScanError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
         if is_link_or_reparse_point(&current)
             || !current.file_type().is_dir()
+            || current_handle != self.handle
             || !same_file_identity(&self.metadata, &current)
             || metadata_changed_during_read(&self.metadata, &current)
         {

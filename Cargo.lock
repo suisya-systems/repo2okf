@@ -633,6 +633,7 @@ dependencies = [
  "blake3",
  "ignore",
  "rayon",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

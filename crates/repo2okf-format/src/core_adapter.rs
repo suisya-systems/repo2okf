@@ -226,7 +226,7 @@ impl From<&RepositoryIr> for RepositorySnapshot {
                 kind,
                 label,
                 std::slice::from_ref(&relationship.id),
-                origin.clone().into_iter(),
+                origin.clone(),
                 relationship.evidence_ids.iter().cloned(),
             );
             if origin.is_some() {
