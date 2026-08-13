@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "crates/repo2okf-core",
+    "crates/repo2okf-agent",
+    "crates/repo2okf-format",
+    "crates/repo2okf-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Repo2OKF contributors"]
+repository = "https://github.com/suisya-systems/repo2okf"
+homepage = "https://github.com/suisya-systems/repo2okf"
+
+[workspace.dependencies]
+anyhow = "1.0"
+blake3 = "1.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+# Keep the scanner compatible with the workspace MSRV. Newer releases in this
+# series intentionally require a newer compiler.
+ignore = "=0.4.25"
+rayon = "1.10"
+regex = "1.11"
+schemars = { version = "1.0", features = ["chrono04"] }
+semver = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+same-file = "1.0.6"
+tempfile = "3.20"
+thiserror = "2.0"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tree-sitter = "0.25"
+tree-sitter-go = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+which = "8.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

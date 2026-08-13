@@ -1,0 +1,18 @@
+schema = 1
+
+[scan]
+include_hidden = false
+max_file_bytes = 2097152
+languages = ["typescript", "javascript", "python", "go", "rust", "markdown"]
+
+[output]
+directory = ".okf"
+ir_file = ".repo2okf/ir.json"
+state_file = ".repo2okf/state.json"
+
+[agent]
+max_repair_attempts = 2
+timeout_seconds = 600
+
+[verify]
+minimum_coverage = 0.0

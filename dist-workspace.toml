@@ -1,0 +1,16 @@
+[dist]
+cargo-dist-version = "0.32.0"
+ci = ["github"]
+packages = ["repo2okf-cli"]
+installers = ["shell", "powershell"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+pr-run-mode = "plan"
+hosting = ["github"]
+install-updater = false
+github-attestations = true

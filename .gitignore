@@ -1,0 +1,7 @@
+/target/
+/.okf/
+/.repo2okf/
+*.profraw
+*.profdata
+.DS_Store
+Thumbs.db

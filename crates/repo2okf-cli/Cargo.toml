@@ -1,0 +1,35 @@
+[package]
+name = "repo2okf-cli"
+description = "Evidence-bound repository-to-OKF compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "repo2okf"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+repo2okf-agent = { path = "../repo2okf-agent" }
+repo2okf-core = { path = "../repo2okf-core" }
+repo2okf-format = { path = "../repo2okf-format" }
+serde.workspace = true
+serde_json.workspace = true
+same-file.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+which.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true
