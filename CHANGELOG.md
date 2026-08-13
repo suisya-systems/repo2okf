@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-08-13
+
+### Fixed
+
+- Removed annotation siblings from JSON Schema `$ref` nodes so Codex accepts
+  Repo2OKF's Structured Outputs contract. Structural siblings continue to fail
+  closed instead of being silently discarded.
+
 ## [0.1.0-alpha.1] - 2026-08-13
 
 First dogfood pre-release. Commands, output details, and Rust APIs may change.
@@ -46,5 +54,6 @@ code-signed or notarized.
 - Raised the source-build MSRV to Rust 1.88 and grouped routine Dependabot
   updates by ecosystem to avoid one pull request per dependency.
 
-[Unreleased]: https://github.com/suisya-systems/repo2okf/compare/v0.1.0-alpha.1...HEAD
+[Unreleased]: https://github.com/suisya-systems/repo2okf/compare/v0.1.0-alpha.2...HEAD
+[0.1.0-alpha.2]: https://github.com/suisya-systems/repo2okf/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/suisya-systems/repo2okf/releases/tag/v0.1.0-alpha.1

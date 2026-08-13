@@ -80,6 +80,16 @@ const UNSUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
     "patternProperties",
     "then",
 ];
+const REF_SIBLING_ANNOTATIONS: &[&str] = &[
+    "$comment",
+    "default",
+    "deprecated",
+    "description",
+    "examples",
+    "readOnly",
+    "title",
+    "writeOnly",
+];
 const MINIMUM_CLAUDE_VERSION: &str = "2.1.227";
 
 /// Common safe surface implemented by vendor CLI drivers.
@@ -425,6 +435,24 @@ fn strict_response_schema() -> Result<serde_json::Value, AgentError> {
 fn normalize_response_schema(value: &mut serde_json::Value) -> Result<(), AgentError> {
     match value {
         serde_json::Value::Object(object) => {
+            if object.contains_key("$ref") {
+                if let Some(keyword) = object
+                    .keys()
+                    .find(|keyword| {
+                        keyword.as_str() != "$ref"
+                            && !REF_SIBLING_ANNOTATIONS.contains(&keyword.as_str())
+                    })
+                    .cloned()
+                {
+                    return Err(schema_error(&format!(
+                        "reference schema has non-annotation sibling keyword {keyword}"
+                    )));
+                }
+                // Codex rejects even standard annotation siblings on `$ref`.
+                // Removing annotations preserves the validation semantics while
+                // keeping descriptions on every non-reference schema node.
+                object.retain(|keyword, _| keyword == "$ref");
+            }
             if let Some(one_of) = object.remove("oneOf")
                 && object.insert("anyOf".into(), one_of).is_some()
             {
@@ -470,6 +498,18 @@ fn validate_common_schema_subset(value: &serde_json::Value) -> Result<(), AgentE
     fn visit(value: &serde_json::Value, path: &str) -> Result<(), AgentError> {
         match value {
             serde_json::Value::Object(object) => {
+                if object.contains_key("$ref") {
+                    if object.len() != 1 {
+                        return Err(schema_error(&format!(
+                            "reference schema has sibling keywords at {path}"
+                        )));
+                    }
+                    if !object.get("$ref").is_some_and(serde_json::Value::is_string) {
+                        return Err(schema_error(&format!(
+                            "reference schema has a non-string target at {path}"
+                        )));
+                    }
+                }
                 for keyword in UNSUPPORTED_SCHEMA_KEYWORDS {
                     if object.contains_key(*keyword) {
                         return Err(schema_error(&format!(
@@ -831,6 +871,7 @@ mod tests {
             ])
         );
         assert_no_unsupported_keywords(&schema);
+        assert_ref_schemas_have_no_siblings(&schema);
     }
 
     #[test]
@@ -887,6 +928,86 @@ mod tests {
         assert_eq!(schema["required"], serde_json::json!(["choice"]));
         assert_eq!(schema["additionalProperties"], false);
         assert_no_unsupported_keywords(&schema);
+    }
+
+    #[test]
+    fn schema_normalizer_removes_ref_annotation_siblings_recursively() {
+        let mut schema = serde_json::json!({
+            "$defs": {
+                "RelationshipKind": {
+                    "type": "string",
+                    "enum": ["depends_on"]
+                }
+            },
+            "type": "object",
+            "properties": {
+                "relationship": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "$ref": "#/$defs/RelationshipKind",
+                            "description": "Proposed architecture relationship kind."
+                        }
+                    }
+                }
+            }
+        });
+
+        normalize_response_schema(&mut schema).expect("normalize reference schema fixture");
+        validate_common_schema_subset(&schema).expect("normalized reference schema contract");
+
+        assert_eq!(
+            schema["properties"]["relationship"]["properties"]["kind"],
+            serde_json::json!({"$ref": "#/$defs/RelationshipKind"})
+        );
+        assert_ref_schemas_have_no_siblings(&schema);
+    }
+
+    #[test]
+    fn schema_normalizer_rejects_structural_ref_siblings() {
+        let mut schema = serde_json::json!({
+            "$ref": "#/$defs/RelationshipKind",
+            "allOf": [{"type": "string"}]
+        });
+
+        let error = normalize_response_schema(&mut schema)
+            .expect_err("structural reference siblings must fail closed");
+        assert!(matches!(&error, super::AgentError::InvalidOutput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("non-annotation sibling keyword allOf")
+        );
+    }
+
+    #[test]
+    fn schema_validator_rejects_ref_siblings() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "RelationshipKind": {
+                    "type": "string",
+                    "enum": ["depends_on"]
+                }
+            },
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": {
+                "kind": {
+                    "$ref": "#/$defs/RelationshipKind",
+                    "description": "Proposed architecture relationship kind."
+                }
+            }
+        });
+
+        let error = validate_common_schema_subset(&schema)
+            .expect_err("all reference siblings must violate the final contract");
+        assert!(matches!(&error, super::AgentError::InvalidOutput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("reference schema has sibling keywords")
+        );
     }
 
     #[test]
@@ -1161,6 +1282,25 @@ mod tests {
             serde_json::Value::Array(values) => {
                 for child in values {
                     assert_no_unsupported_keywords(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_ref_schemas_have_no_siblings(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object.contains_key("$ref") {
+                    assert_eq!(object.len(), 1, "$ref must be the only keyword: {object:?}");
+                }
+                for child in object.values() {
+                    assert_ref_schemas_have_no_siblings(child);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    assert_ref_schemas_have_no_siblings(child);
                 }
             }
             _ => {}

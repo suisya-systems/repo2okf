@@ -23,4 +23,4 @@ pub use process::{AgentError, ProcessConfig};
 /// Revision of the vendor prompt, schema, and process-isolation contract.
 ///
 /// Incremental consumers should include this value in build fingerprints.
-pub const AGENT_CONTRACT_VERSION: &str = "9";
+pub const AGENT_CONTRACT_VERSION: &str = "10";

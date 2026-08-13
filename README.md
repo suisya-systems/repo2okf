@@ -13,15 +13,15 @@ Install the current pre-release with the platform installer:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.1/repo2okf-installer.sh | sh
+  https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.2/repo2okf-installer.sh | sh
 ```
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.1/repo2okf-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.2/repo2okf-installer.ps1 | iex"
 ```
 
 Windows, macOS and Linux archives are also attached to the
-[`v0.1.0-alpha.1` pre-release](https://github.com/suisya-systems/repo2okf/releases/tag/v0.1.0-alpha.1).
+[`v0.1.0-alpha.2` pre-release](https://github.com/suisya-systems/repo2okf/releases/tag/v0.1.0-alpha.2).
 Source builds require Rust 1.88 or newer; see the
 [distribution guide](docs/distribution.md).
 
