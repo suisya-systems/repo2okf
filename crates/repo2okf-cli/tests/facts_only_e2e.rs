@@ -65,6 +65,7 @@ if [ "$#" -eq 2 ] && [ "$1" = "auth" ] && [ "$2" = "status" ]; then
   printf '%s\n' '{{"loggedIn":true}}'
   exit 0
 fi
+while IFS= read -r _line; do :; done
 printf '%s' '{response}'
 "#
     );
