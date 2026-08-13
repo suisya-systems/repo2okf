@@ -23,17 +23,20 @@ timeout_seconds = 600
 minimum_coverage = 0.0
 ```
 
-Command-line `--agent`, `--facts-only`, `--output` and strictness options
-override their corresponding behavior for that invocation. Relative paths are
-resolved from the repository root, not the current working directory after
-startup.
+Agent selection and strictness are invocation-level CLI choices rather than
+repository settings. The generated bundle directory is currently fixed to
+`.okf`; both `output.directory` and `--output` must use that value. Relative
+configuration paths are resolved from the repository root, not the current
+working directory after startup. See the [CLI reference](cli-reference.md) for
+command options and their conflict rules.
 
 Generated output and internal state use the reserved `.okf` and `.repo2okf`
-directories. Both are compiler-owned generated caches, are ignored by Git by
-default, and should not be committed. Do not reuse either directory from an
-untrusted checkout. Existing `.okf` content is replaced only when its fixed
-ownership marker matches; the marker is an accidental-deletion guard, not an
-authentication proof.
+directories. Both are compiler-owned generated caches. Add them to the target
+repository's `.gitignore`; `repo2okf init` does not edit `.gitignore`. They
+should not be committed or reused from an untrusted checkout. Existing `.okf`
+and `.repo2okf` content is replaced only when its fixed ownership marker
+matches; the marker is an accidental-deletion guard, not an authentication
+proof.
 
 CI should start with both cache directories absent and run a clean
 `repo2okf compile --facts-only` build. Agent-enriched prose is non-deterministic,
@@ -56,6 +59,13 @@ invocation time; see the [upstream changelog][claude-2-1-227].
 The default minimum coverage is zero so partially supported repositories still
 produce a useful bundle. Set a project quality gate explicitly, or use
 `--strict` to require complete non-excluded coverage.
+
+Configuration rejects unknown fields and supports only `schema = 1`.
+`scan.languages` must not be empty. `scan.max_file_bytes` must be between 1 and
+67108864, `agent.max_repair_attempts` between 0 and 5,
+`agent.timeout_seconds` between 1 and 3600, and `verify.minimum_coverage`
+between 0 and 1. The IR and state paths must be distinct, non-nested files
+inside `.repo2okf/`.
 
 Language names are case-insensitive and accept the aliases `js`, `ts`, `py`,
 `golang`, `rs`, and `md`. Python is enabled in the starter configuration.
