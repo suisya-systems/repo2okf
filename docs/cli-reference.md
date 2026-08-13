@@ -63,6 +63,18 @@ repo2okf doctor
 repo2okf compile --agent claude
 ```
 
+Generate human-readable OKF prose in Japanese by setting the repository
+configuration (the CLI itself remains English):
+
+```toml
+[output]
+locale = "ja"
+```
+
+The locale applies to generated descriptions, claims, and safe presentation
+labels. Machine-readable keys, IDs, paths, symbols, OKF types/statuses/kinds,
+and code are never translated.
+
 Use Codex after explicitly allowing its CLI to read the repository:
 
 ```console
@@ -160,6 +172,9 @@ Accepts the same options as `compile`. It performs a full deterministic rescan,
 compares the new state with the saved state, and verifies the existing bundle.
 If the inputs and bundle are unchanged, it skips publication; otherwise it
 rebuilds the bundle.
+
+Changing `output.locale` is an output-contract change, so `update` renders and
+verifies a new bundle instead of accepting the previous language as current.
 
 `update` does not yet reuse individual parse results. Its current optimization
 is skipping an unchanged, verified build after the rescan.
@@ -268,6 +283,10 @@ the target repository's `.gitignore`, do not commit them, and do not reuse them
 from an untrusted checkout. Each directory is replaced as a whole: do not store
 user files inside it, and do not run concurrent Repo2OKF writers for the same
 repository. See the [security model] for publication and recovery details.
+
+Every generated index and concept records `repo2okf.output_locale` as `en` or
+`ja`. Verification rejects a missing or mixed locale when checking a bundle
+against the configured output locale.
 
 ## Exit status and output
 

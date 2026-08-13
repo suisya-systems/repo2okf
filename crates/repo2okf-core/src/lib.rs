@@ -12,18 +12,19 @@ mod scanner;
 pub use incremental::{BuildState, ChangeSet, compute_changes};
 pub use model::{
     ArchitectureConcept, ArchitectureRelationship, ArchitectureRelationshipKind, ArchitectureScope,
-    ArchitectureStatus, Claim, ClaimProvenance, CoverageDisposition, CoverageItem, CoverageKind,
-    CoverageReport, Entity, EntityKind, EvidenceRef, FileRecord, ImportRecord, Language,
-    Relationship, RelationshipKind, RelationshipOrigin, RepositoryIr, RepositoryMetadata,
-    ScanStatus, SemanticCoverage, SemanticReference, SemanticReferenceKind, SemanticResolution,
+    ArchitectureStatus, Claim, ClaimFact, ClaimProvenance, CoverageDisposition, CoverageItem,
+    CoverageKind, CoverageReport, Entity, EntityKind, EvidenceRef, FileRecord, ImportRecord,
+    Language, OutputLocale, Relationship, RelationshipKind, RelationshipOrigin, RepositoryIr,
+    RepositoryMetadata, ScanStatus, SemanticCoverage, SemanticReference, SemanticReferenceKind,
+    SemanticResolution,
 };
 pub use scanner::{ScanError, ScanOptions, scan_repository};
 
 /// Version of the serialized repository intermediate representation.
-pub const IR_SCHEMA_VERSION: u32 = 2;
+pub const IR_SCHEMA_VERSION: u32 = 3;
 
 /// Version identifier included in evidence extractor metadata.
 ///
 /// Increment the algorithm revision whenever scan or fingerprint semantics
 /// change, even before the next package release.
-pub const EXTRACTOR_VERSION: &str = concat!("repo2okf-core/", env!("CARGO_PKG_VERSION"), "+scan.5");
+pub const EXTRACTOR_VERSION: &str = concat!("repo2okf-core/", env!("CARGO_PKG_VERSION"), "+scan.6");

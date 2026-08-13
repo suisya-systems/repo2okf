@@ -65,6 +65,7 @@ if [ "$#" -eq 2 ] && [ "$1" = "auth" ] && [ "$2" = "status" ]; then
   printf '%s\n' '{{"loggedIn":true}}'
   exit 0
 fi
+while IFS= read -r _line; do :; done
 printf '%s' '{response}'
 "#
     );
@@ -146,6 +147,92 @@ fn bundle_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut files = BTreeMap::new();
     collect(root, root, &mut files);
     files
+}
+
+fn write_output_locale_config(root: &Path, locale: &str) {
+    fs::write(
+        root.join("repo2okf.toml"),
+        format!(
+            concat!(
+                "schema = 1\n\n",
+                "[output]\n",
+                "directory = \".okf\"\n",
+                "ir_file = \".repo2okf/ir.json\"\n",
+                "state_file = \".repo2okf/state.json\"\n",
+                "locale = \"{}\"\n",
+            ),
+            locale,
+        ),
+    )
+    .expect("write output locale config");
+}
+
+#[test]
+fn output_locale_rerenders_prose_without_changing_repository_ir() {
+    let fixture = tempfile::tempdir().expect("temporary repository");
+    let root = fixture.path();
+    fs::write(
+        root.join("service.py"),
+        "\"\"\"Greeting service.\"\"\"\n\ndef greet(name: str) -> str:\n    \"\"\"Return a greeting.\"\"\"\n    return f\"Hello {name}\"\n",
+    )
+    .expect("write Python fixture");
+
+    write_output_locale_config(root, "en");
+    let english = repo2okf(root, &["compile", "--facts-only"]);
+    assert_success(&english, "English facts-only compile");
+    let english_ir: Value = serde_json::from_slice(
+        &fs::read(root.join(".repo2okf/ir.json")).expect("English IR bytes"),
+    )
+    .expect("English IR JSON");
+    let english_bundle = bundle_bytes(&root.join(".okf"));
+    let english_text = english_bundle
+        .values()
+        .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(english_text.contains("output_locale: en"));
+    assert!(english_text.contains("Evidence-bound claims"));
+
+    write_output_locale_config(root, "ja");
+    let japanese = repo2okf(root, &["update", "--facts-only"]);
+    assert_success(&japanese, "Japanese facts-only update");
+    assert!(!stdout(&japanese).contains("up to date:"));
+    let japanese_ir: Value = serde_json::from_slice(
+        &fs::read(root.join(".repo2okf/ir.json")).expect("Japanese IR bytes"),
+    )
+    .expect("Japanese IR JSON");
+    let japanese_bundle = bundle_bytes(&root.join(".okf"));
+    let japanese_text = japanese_bundle
+        .values()
+        .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(japanese_text.contains("output_locale: ja"));
+    assert!(japanese_text.contains("証拠に紐づく主張"));
+    assert!(japanese_text.contains("宣言されています"));
+    assert_ne!(english_bundle, japanese_bundle);
+
+    for field in [
+        "fingerprint",
+        "files",
+        "entities",
+        "evidence",
+        "relationships",
+        "semantic_references",
+        "semantic_coverage",
+        "coverage",
+    ] {
+        assert_eq!(
+            english_ir[field], japanese_ir[field],
+            "locale changed deterministic IR field {field}"
+        );
+    }
+    assert_eq!(english_ir["claims"], japanese_ir["claims"]);
+
+    let verify = repo2okf(root, &["verify", "--strict", "--json"]);
+    assert_success(&verify, "Japanese strict verification");
+    let verification: Value = serde_json::from_slice(&verify.stdout).expect("verification JSON");
+    assert_eq!(verification["valid"], true);
 }
 
 #[test]
@@ -778,6 +865,7 @@ fn fake_claude_candidate_becomes_a_scoped_draft_okf_concept() {
         ),
     )
     .expect("write service fixture");
+    write_output_locale_config(root, "ja");
 
     assert_success(&repo2okf(root, &["scan"]), "seed deterministic IR");
     let seed_ir: Value =
@@ -845,8 +933,8 @@ fn fake_claude_candidate_becomes_a_scoped_draft_okf_concept() {
             "summary_evidence_ids": [],
             "concept_candidates": [{
                 "candidate_key": "greeting-flow",
-                "title": "Greeting flow",
-                "responsibility": "Connects the greeting entry point to its local helper.",
+                "title": "挨拶フロー",
+                "responsibility": "挨拶の入口をローカルヘルパーへ接続します。",
                 "member_entity_ids": [welcome_id, greet_id],
                 "supporting_edge_ids": [call_id],
                 "evidence_ids": concept_evidence_ids.clone()
@@ -857,7 +945,11 @@ fn fake_claude_candidate_becomes_a_scoped_draft_okf_concept() {
     let fake_agent = tempfile::tempdir().expect("fake agent directory");
     let fake_bin = fake_agent.path().join("bin");
     write_fake_claude(&fake_bin, &response);
-    let compile = repo2okf_with_fake_bin(root, &["compile", "--agent", "claude"], &fake_bin);
+    let compile = repo2okf_with_fake_bin(
+        root,
+        &["compile", "--agent", "claude", "--reuse-agent-cache"],
+        &fake_bin,
+    );
     assert_success(&compile, "compile through fake Claude process boundary");
     assert!(stdout(&compile).contains("claude enrichment accepted after 1 attempt(s)"));
 
@@ -873,7 +965,11 @@ fn fake_claude_candidate_becomes_a_scoped_draft_okf_concept() {
         ir["architecture_concepts"].as_array().map(Vec::len),
         Some(1)
     );
-    assert_eq!(architecture["title"], "Greeting flow");
+    assert_eq!(architecture["title"], "挨拶フロー");
+    assert_eq!(
+        architecture["responsibility"],
+        "挨拶の入口をローカルヘルパーへ接続します。"
+    );
     assert_eq!(architecture["status"], "draft");
     assert_eq!(architecture["provenance"]["kind"], "agent");
     assert_eq!(architecture["provenance"]["provider"], "claude");
@@ -944,6 +1040,9 @@ fn fake_claude_candidate_becomes_a_scoped_draft_okf_concept() {
     assert_eq!(architecture_documents.len(), 1);
     let document = &architecture_documents[0];
     assert!(document.contains("status: draft"));
+    assert!(document.contains("output_locale: ja"));
+    assert!(document.contains("title: 挨拶フロー"));
+    assert!(document.contains("挨拶の入口をローカルヘルパーへ接続します。"));
     assert!(document.contains("repo2okf-agent/claude"));
     assert!(!document.contains("verified:"));
     for retained_id in [
@@ -964,4 +1063,45 @@ fn fake_claude_candidate_becomes_a_scoped_draft_okf_concept() {
     assert_success(&verify, "verify agent draft bundle");
     let verification: Value = serde_json::from_slice(&verify.stdout).expect("verification JSON");
     assert_eq!(verification["valid"], true);
+
+    write_output_locale_config(root, "en");
+    let english_response = serde_json::json!({
+        "type": "result",
+        "structured_output": {
+            "claims": [],
+            "repository_summary": null,
+            "summary_evidence_ids": [],
+            "concept_candidates": [{
+                "candidate_key": "greeting-flow",
+                "title": "Greeting flow",
+                "responsibility": "Connects the greeting entry point to its local helper.",
+                "member_entity_ids": [welcome_id, greet_id],
+                "supporting_edge_ids": [call_id],
+                "evidence_ids": concept_evidence_ids
+            }],
+            "relationship_candidates": []
+        }
+    });
+    let english_agent = tempfile::tempdir().expect("English fake agent directory");
+    let english_bin = english_agent.path().join("bin");
+    write_fake_claude(&english_bin, &english_response);
+    let update = repo2okf_with_fake_bin(
+        root,
+        &["update", "--agent", "claude", "--reuse-agent-cache"],
+        &english_bin,
+    );
+    assert_success(&update, "locale-changing agent update");
+    assert!(
+        stdout(&update).contains("claude enrichment accepted after 1 attempt(s)"),
+        "a locale change must not reuse prose from the prior locale"
+    );
+    let english_documents = bundle_bytes(&root.join(".okf"))
+        .into_values()
+        .filter_map(|bytes| String::from_utf8(bytes).ok())
+        .filter(|contents| contents.contains("type: Architecture Component\n"))
+        .collect::<Vec<_>>();
+    assert_eq!(english_documents.len(), 1);
+    assert!(english_documents[0].contains("output_locale: en"));
+    assert!(english_documents[0].contains("title: Greeting flow"));
+    assert!(!english_documents[0].contains("挨拶フロー"));
 }

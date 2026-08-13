@@ -65,6 +65,21 @@ parse-result reuse is not implemented yet.
 They should remain uncommitted and must not be trusted or reused when supplied
 by an untrusted checkout.
 
+## Output locale boundary
+
+Repository scanning and semantic IR are locale-neutral. Scanner-owned prose is
+represented as structured facts with stable source/evidence/semantic IDs, then
+rendered by the format layer in the configured `en` or `ja` output locale.
+Changing locale therefore rerenders OKF and changes the agent request contract,
+but does not change repository facts or their fingerprint. The emitter records
+the selected locale in every generated document and the verifier rejects mixed
+bundles.
+
+Only human-readable OKF prose is localized. Schema keys, identifiers, paths,
+symbols, code, hashes, types, statuses, tags, relationship kinds, diagnostic
+codes, CLI output, and implementation-facing documentation stay canonical and
+English-based.
+
 ## Dependency resolution scope
 
 The scanner resolves JavaScript and TypeScript relative imports when exactly one
@@ -130,7 +145,7 @@ in this release.
 ## Initial public contracts
 
 The core crate exposes `scan_repository`, `RepositoryIr`, `SemanticReference`,
-`SemanticResolution`, `ArchitectureScope`, `Claim`, `EvidenceRef`,
+`SemanticResolution`, `ArchitectureScope`, `OutputLocale`, `Claim`, `EvidenceRef`,
 `CoverageReport`, `BuildState` and `compute_changes`.
 
 The agent crate exposes `AgentDriver`, `CodexDriver`, `ClaudeDriver`,

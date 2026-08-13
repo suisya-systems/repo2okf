@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use repo2okf_core::{
     ArchitectureConcept, ArchitectureRelationship, ArchitectureRelationshipKind, ArchitectureScope,
-    ArchitectureStatus, Claim, ClaimProvenance, CoverageItem, Entity, EvidenceRef, Relationship,
-    SemanticReference,
+    ArchitectureStatus, Claim, ClaimProvenance, CoverageItem, Entity, EvidenceRef, OutputLocale,
+    Relationship, SemanticReference,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,8 @@ pub struct EnrichmentRequest {
     pub repository: String,
     /// Deterministic IR fingerprint.
     pub ir_fingerprint: String,
+    /// Language for model-authored human-readable output fields.
+    pub output_locale: OutputLocale,
     /// Complete evidence catalog available to claims.
     pub evidence: Vec<EvidenceRef>,
     /// Host-verified, bounded source text corresponding to evidence records.
@@ -201,7 +203,7 @@ pub struct EnrichmentResponse {
     /// Evidence-bound semantic claims.
     #[serde(default)]
     pub claims: Vec<Claim>,
-    /// Evidence-backed summary suitable for an OKF bundle index.
+    /// Evidence-backed summary in the requested output locale, suitable for an OKF bundle index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_summary: Option<String>,
     /// Evidence IDs supporting the repository summary.
@@ -280,9 +282,9 @@ impl EnrichmentResponse {
 pub struct ConceptCandidate {
     /// Response-local key used by relationship candidates.
     pub candidate_key: String,
-    /// Concise architecture-level concept title.
+    /// Concise architecture-level concept title in the requested output locale.
     pub title: String,
-    /// Evidence-backed responsibility shared by the member entities.
+    /// Evidence-backed responsibility in the requested output locale.
     pub responsibility: String,
     /// Supplied deterministic entity IDs grouped by this concept.
     pub member_entity_ids: Vec<String>,

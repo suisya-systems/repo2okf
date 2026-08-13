@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use repo2okf_core::{
-    ClaimProvenance, Relationship, RelationshipOrigin, RepositoryIr, SemanticResolution,
+    ClaimProvenance, OutputLocale, Relationship, RelationshipOrigin, RepositoryIr,
+    SemanticResolution,
 };
 
 use crate::excerpts::verified_excerpts;
@@ -895,6 +896,7 @@ pub fn enrich_with_repair(
     driver: &dyn AgentDriver,
     ir: &RepositoryIr,
     config: &ProcessConfig,
+    output_locale: OutputLocale,
     options: RepairOptions,
 ) -> Result<(EnrichmentResponse, EnrichmentStats), AgentError> {
     let mut request = EnrichmentRequest {
@@ -902,6 +904,7 @@ pub fn enrich_with_repair(
         evidence_excerpts: verified_excerpts(&config.repository, &ir.evidence),
         repository: ir.repository.name.clone(),
         ir_fingerprint: ir.fingerprint.clone(),
+        output_locale,
         coverage: Vec::new(),
         semantic_graph: SuppliedSemanticGraph::default(),
         existing_agent_claims: Vec::new(),
@@ -1300,6 +1303,7 @@ fn stamp_agent_provenance(driver: &dyn AgentDriver, response: &mut EnrichmentRes
         response.claims.push(repo2okf_core::Claim {
             id: "claim:agent:repository-summary".into(),
             text: summary.to_owned(),
+            fact: None,
             evidence_ids: response.summary_evidence_ids.clone(),
             provenance: ClaimProvenance::Agent {
                 provider,
@@ -1329,7 +1333,7 @@ mod tests {
     };
 
     use repo2okf_core::{
-        Claim, ClaimProvenance, RelationshipKind, RelationshipOrigin, ScanOptions,
+        Claim, ClaimProvenance, OutputLocale, RelationshipKind, RelationshipOrigin, ScanOptions,
         SemanticReferenceKind, SemanticResolution, scan_repository,
     };
 
@@ -1353,6 +1357,7 @@ mod tests {
             claims: vec![Claim {
                 id: "claim:agent".into(),
                 text: "Fabricated claim".into(),
+                fact: None,
                 evidence_ids: vec!["evidence:not-real".into()],
                 provenance: ClaimProvenance::Agent {
                     provider: "fixture".into(),
@@ -1378,6 +1383,7 @@ mod tests {
             claims: vec![Claim {
                 id: "claim:\u{7}bad".into(),
                 text: format!("first line\n{}", "x".repeat(4097)),
+                fact: None,
                 evidence_ids: vec![evidence_id.clone()],
                 provenance: ClaimProvenance::Agent {
                     provider: "fixture".into(),
@@ -1415,6 +1421,7 @@ mod tests {
             claims: vec![Claim {
                 id: "claim:agent".into(),
                 text: "Unsupported because its excerpt was omitted".into(),
+                fact: None,
                 evidence_ids: vec!["ev:omitted".into()],
                 provenance: ClaimProvenance::Agent {
                     provider: "fixture".into(),
@@ -1802,6 +1809,7 @@ mod tests {
             &driver,
             &ir,
             &process,
+            OutputLocale::Ja,
             RepairOptions {
                 max_repair_attempts: 1,
             },
@@ -1812,6 +1820,10 @@ mod tests {
         assert!(stats.architecture_scope.is_some());
         assert!(response.accepted_concepts.is_empty());
         assert!(response.accepted_relationships.is_empty());
+        assert_eq!(
+            *driver.locales.lock().expect("request locales"),
+            [OutputLocale::Ja, OutputLocale::Ja]
+        );
         let repair_codes = driver.repair_codes.lock().expect("repair codes");
         assert!(
             repair_codes[1]
@@ -1828,6 +1840,7 @@ mod tests {
     #[derive(Default)]
     struct RepairDriver {
         calls: AtomicUsize,
+        locales: Mutex<Vec<OutputLocale>>,
         repair_codes: Mutex<Vec<Vec<String>>>,
     }
 
@@ -1852,6 +1865,10 @@ mod tests {
             request: &EnrichmentRequest,
             _config: &ProcessConfig,
         ) -> Result<EnrichmentResponse, crate::AgentError> {
+            self.locales
+                .lock()
+                .expect("request locales")
+                .push(request.output_locale);
             self.repair_codes.lock().expect("repair codes").push(
                 request
                     .repair_issues
@@ -1911,6 +1928,7 @@ mod tests {
         EnrichmentRequest {
             repository: "fixture".into(),
             ir_fingerprint: "fixture-fingerprint".into(),
+            output_locale: OutputLocale::En,
             evidence: vec![],
             evidence_excerpts: vec![],
             coverage: vec![],

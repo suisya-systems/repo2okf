@@ -268,11 +268,14 @@ fn compile(
                     .filter(|saved| selection != AgentSelection::Off || saved.claims == ir.claims)
                     .filter(|saved| saved.validate().is_ok());
                 let snapshot = if selection == AgentSelection::Off {
-                    RepositorySnapshot::from(&ir)
+                    RepositorySnapshot::from_ir_with_locale(&ir, config.output.locale)
                 } else {
-                    saved_ir
-                        .as_ref()
-                        .map_or_else(|| RepositorySnapshot::from(&ir), RepositorySnapshot::from)
+                    saved_ir.as_ref().map_or_else(
+                        || RepositorySnapshot::from_ir_with_locale(&ir, config.output.locale),
+                        |saved| {
+                            RepositorySnapshot::from_ir_with_locale(saved, config.output.locale)
+                        },
+                    )
                 };
                 let report = verify_snapshot(&output, &snapshot, config, args.strict);
                 if saved_ir.is_some()
@@ -325,6 +328,7 @@ fn compile(
             driver.as_ref(),
             &ir,
             &process,
+            config.output.locale,
             RepairOptions {
                 max_repair_attempts: config.agent.max_repair_attempts,
             },
@@ -357,6 +361,7 @@ fn compile(
                 reviewer.as_ref(),
                 &ir,
                 &process,
+                config.output.locale,
                 RepairOptions {
                     max_repair_attempts: config.agent.max_repair_attempts,
                 },
@@ -383,7 +388,7 @@ fn compile(
 
     repository.verify()?;
     ir.validate().map_err(anyhow::Error::msg)?;
-    let snapshot = RepositorySnapshot::from(&ir);
+    let snapshot = RepositorySnapshot::from_ir_with_locale(&ir, config.output.locale);
     let output = output_directory(repository_path, config, args.output.as_deref())?;
     let persisted_state =
         BuildState::from_ir(&ir, build_fingerprint).with_persisted_ir_hash(persisted_ir_hash(&ir)?);
@@ -496,7 +501,7 @@ fn verify(repository: &io::RepositoryGuard, config: &Config, args: &VerifyArgs) 
         .iter()
         .map(repo2okf_format::EvidenceRecord::from)
         .collect::<Vec<_>>();
-    let snapshot = RepositorySnapshot::from(&saved_ir);
+    let snapshot = RepositorySnapshot::from_ir_with_locale(&saved_ir, config.output.locale);
     let target = args.target.as_deref().unwrap_or(&config.output.directory);
     let target = io::resolve_beneath(repository_path, target)?;
     if !target.is_dir() {
@@ -990,6 +995,7 @@ fn verification_options(
                 .collect()
         }),
         semantic_inventory: snapshot.and_then(|snapshot| snapshot.semantic_inventory.clone()),
+        expected_output_locale: Some(config.output.locale),
         freshness_mismatches,
         ..VerifyOptions::default()
     }

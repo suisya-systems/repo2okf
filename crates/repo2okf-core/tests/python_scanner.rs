@@ -3,8 +3,9 @@
 use std::fs;
 
 use repo2okf_core::{
-    ClaimProvenance, EntityKind, EvidenceRef, Language, RelationshipOrigin, ScanOptions,
-    ScanStatus, SemanticReferenceKind, SemanticResolution, scan_repository,
+    ClaimFact, ClaimProvenance, EntityKind, EvidenceRef, Language, OutputLocale,
+    RelationshipOrigin, ScanOptions, ScanStatus, SemanticReferenceKind, SemanticResolution,
+    scan_repository,
 };
 
 #[test]
@@ -26,6 +27,45 @@ fn python_is_a_default_case_insensitive_language_and_can_be_disabled() {
     assert_eq!(file.language, Some(Language::Python));
     assert_eq!(file.status, ScanStatus::Unsupported);
     assert!(ir.entities.is_empty());
+}
+
+#[test]
+fn version_three_ir_requires_consistent_deterministic_claim_facts() {
+    let repository = tempfile::tempdir().expect("repository");
+    fs::write(
+        repository.path().join("fixture.py"),
+        "def greet():\n    pass\n",
+    )
+    .expect("Python fixture");
+    let ir = scan_repository(repository.path(), &ScanOptions::default()).expect("scan");
+    ir.validate().expect("valid structured claims");
+
+    let mut missing = ir.clone();
+    missing.claims[0].fact = None;
+    assert!(
+        missing
+            .validate()
+            .is_err_and(|error| error.contains("has no structured fact"))
+    );
+
+    let mut inconsistent = ir.clone();
+    inconsistent.claims[0].text = "forged deterministic text".into();
+    assert!(
+        inconsistent
+            .validate()
+            .is_err_and(|error| error.contains("disagrees with its structured fact"))
+    );
+
+    let mut agent_fact = ir;
+    agent_fact.claims[0].provenance = ClaimProvenance::Agent {
+        provider: "fixture".into(),
+        model: None,
+    };
+    assert!(
+        agent_fact
+            .validate()
+            .is_err_and(|error| error.contains("must not supply a deterministic fact"))
+    );
 }
 
 #[test]
@@ -180,6 +220,17 @@ fn extracts_python_entities_imports_decorators_and_docstrings_deterministically(
         ClaimProvenance::Deterministic { .. }
     ));
     assert_eq!(welcome_claim.confidence, Some(100));
+    assert!(matches!(
+        welcome_claim.fact,
+        Some(ClaimFact::PythonSymbolDocstring {
+            entity_kind: EntityKind::Method,
+            ..
+        })
+    ));
+    assert_eq!(
+        welcome_claim.text_for(OutputLocale::Ja),
+        "fixture.py で宣言されたメソッド `welcome` には、Python のドキュメント文字列があります。"
+    );
     assert!(!welcome_claim.text.contains("Welcome docs."));
     assert!(
         first
@@ -187,6 +238,14 @@ fn extracts_python_entities_imports_decorators_and_docstrings_deterministically(
             .iter()
             .any(|claim| claim.text == "fixture.py has a Python module docstring.")
     );
+    assert!(first.claims.iter().all(|claim| claim.fact.is_some()));
+    let fingerprint = first.fingerprint.clone();
+    let _localized = first
+        .claims
+        .iter()
+        .map(|claim| claim.text_for(OutputLocale::Ja))
+        .collect::<Vec<_>>();
+    assert_eq!(first.fingerprint, fingerprint);
 }
 
 #[test]

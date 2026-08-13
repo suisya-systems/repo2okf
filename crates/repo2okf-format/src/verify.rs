@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::{NaiveDate, Utc};
 use regex::Regex;
+use repo2okf_core::OutputLocale;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
@@ -46,6 +47,10 @@ pub struct VerifyOptions {
     ///
     /// Absence preserves baseline validation for hand-authored OKF bundles.
     pub semantic_inventory: Option<SemanticInventory>,
+    /// Required locale declaration for compiler-owned generated prose.
+    ///
+    /// Absence preserves compatibility with hand-authored OKF bundles.
+    pub expected_output_locale: Option<OutputLocale>,
 }
 
 impl Default for VerifyOptions {
@@ -58,6 +63,7 @@ impl Default for VerifyOptions {
             expected_concepts: None,
             freshness_mismatches: BTreeSet::new(),
             semantic_inventory: None,
+            expected_output_locale: None,
         }
     }
 }
@@ -184,7 +190,7 @@ pub fn verify_okf<P: AsRef<Path>>(
         .filter(|path| is_markdown(path))
         .cloned()
         .collect::<Vec<_>>();
-    validate_root_index(bundle_dir, &markdown_files, &mut issues);
+    validate_root_index(bundle_dir, &markdown_files, options, &mut issues);
 
     let mut concepts = Vec::new();
     let mut concept_ids = BTreeMap::new();
@@ -450,7 +456,12 @@ fn validate_portable_file_collisions(files: &[PathBuf], issues: &mut Vec<Verific
     }
 }
 
-fn validate_root_index(root: &Path, files: &[PathBuf], issues: &mut Vec<VerificationIssue>) {
+fn validate_root_index(
+    root: &Path,
+    files: &[PathBuf],
+    options: &VerifyOptions,
+    issues: &mut Vec<VerificationIssue>,
+) {
     let Some(index) = files
         .iter()
         .find(|path| normalize_slashes(path).eq_ignore_ascii_case("index.md"))
@@ -461,6 +472,7 @@ fn validate_root_index(root: &Path, files: &[PathBuf], issues: &mut Vec<Verifica
             None,
             "root index.md is recommended for progressive disclosure".to_owned(),
         );
+        validate_expected_output_locale(None, Some("index.md".to_owned()), options, issues);
         return;
     };
     let Some(contents) = read_text(root, index, issues) else {
@@ -473,29 +485,93 @@ fn validate_root_index(root: &Path, files: &[PathBuf], issues: &mut Vec<Verifica
             Some(path_string(index)),
             "root index.md does not declare okf_version".to_owned(),
         );
+        validate_expected_output_locale(None, Some(path_string(index)), options, issues);
         return;
     };
     match serde_yaml::from_str::<BTreeMap<String, serde_yaml::Value>>(yaml) {
-        Ok(metadata) => match metadata.get("okf_version").and_then(value_as_string) {
-            Some(version) if version == OKF_VERSION => {}
-            Some(version) => error(
-                issues,
-                "unsupported-okf-version",
-                Some(path_string(index)),
-                format!("expected OKF {OKF_VERSION}, found `{version}`"),
-            ),
-            None => warning(
-                issues,
-                "missing-okf-version",
-                Some(path_string(index)),
-                "root index.md does not declare okf_version".to_owned(),
-            ),
-        },
+        Ok(metadata) => {
+            match metadata.get("okf_version").and_then(value_as_string) {
+                Some(version) if version == OKF_VERSION => {}
+                Some(version) => error(
+                    issues,
+                    "unsupported-okf-version",
+                    Some(path_string(index)),
+                    format!("expected OKF {OKF_VERSION}, found `{version}`"),
+                ),
+                None => warning(
+                    issues,
+                    "missing-okf-version",
+                    Some(path_string(index)),
+                    "root index.md does not declare okf_version".to_owned(),
+                ),
+            }
+            validate_index_output_locale(&metadata, index, options, issues);
+        }
         Err(source) => error(
             issues,
             "invalid-index-frontmatter",
             Some(path_string(index)),
             format!("could not parse root index frontmatter: {source}"),
+        ),
+    }
+}
+
+fn validate_index_output_locale(
+    metadata: &BTreeMap<String, serde_yaml::Value>,
+    index: &Path,
+    options: &VerifyOptions,
+    issues: &mut Vec<VerificationIssue>,
+) {
+    let locale_key = serde_yaml::Value::String("output_locale".to_owned());
+    let declared = metadata
+        .get("repo2okf")
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|extension| extension.get(&locale_key));
+    let document = Some(path_string(index));
+    let parsed = match declared {
+        Some(serde_yaml::Value::String(value)) => match value.parse::<OutputLocale>() {
+            Ok(locale) => Some(locale),
+            Err(reason) => {
+                error(issues, "invalid-output-locale", document.clone(), reason);
+                None
+            }
+        },
+        Some(_) => {
+            error(
+                issues,
+                "invalid-output-locale",
+                document.clone(),
+                "repo2okf.output_locale must be `en` or `ja`".to_owned(),
+            );
+            None
+        }
+        None => None,
+    };
+    validate_expected_output_locale(parsed, document, options, issues);
+}
+
+fn validate_expected_output_locale(
+    declared: Option<OutputLocale>,
+    document: Option<String>,
+    options: &VerifyOptions,
+    issues: &mut Vec<VerificationIssue>,
+) {
+    let Some(expected) = options.expected_output_locale else {
+        return;
+    };
+    match declared {
+        Some(actual) if actual == expected => {}
+        Some(actual) => error(
+            issues,
+            "output-locale-mismatch",
+            document,
+            format!("expected output locale `{expected}`, found `{actual}`"),
+        ),
+        None => error(
+            issues,
+            "missing-output-locale",
+            document,
+            format!("expected output locale `{expected}`, but none was declared"),
         ),
     }
 }
@@ -645,6 +721,16 @@ fn validate_concepts(
 
     for concept in concepts {
         let document = Some(path_string(&concept.relative_path));
+        validate_expected_output_locale(
+            concept
+                .metadata
+                .repo2okf
+                .as_ref()
+                .and_then(|extension| extension.output_locale),
+            document.clone(),
+            options,
+            issues,
+        );
         if concept
             .metadata
             .generated

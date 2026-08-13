@@ -30,6 +30,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   relationships without generating a document per symbol or reference.
 - Evidence-preserving semantic relationships and always-draft, host-validated
   architecture concept proposals from optional agents.
+- Configurable English or Japanese human-readable OKF prose while preserving
+  canonical machine fields, source facts, and semantic IDs.
 
 ### Changed
 

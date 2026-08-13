@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, NaiveDate, Utc};
 use repo2okf_format::{
     ArchitectureScope, CoverageClassification, CoverageItem, EmitError, EvidenceRecord, Generated,
-    OkfArchitectureConcept, OkfClaim, OkfDocument, OkfRelationship, OkfStatus,
+    OkfArchitectureConcept, OkfClaim, OkfDocument, OkfRelationship, OkfStatus, OutputLocale,
     ProjectedSemanticRelationship, Repo2OkfMetadata, RepositorySnapshot, SemanticInventory,
     Severity, Verification, VerifyOptions, concept_path, emit_okf, verify_okf,
 };
@@ -44,6 +44,7 @@ fn document(id: &str, evidence_id: &str) -> OkfDocument {
 fn snapshot() -> RepositorySnapshot {
     RepositorySnapshot {
         repository: "demo".to_owned(),
+        output_locale: OutputLocale::En,
         documents: vec![document("modules/auth", "ev-auth")],
         evidence: vec![evidence("ev-auth", "src/auth.rs", "blake3:auth")],
         coverage: vec![CoverageItem {
@@ -158,6 +159,174 @@ fn emits_a_valid_evidence_bound_bundle() {
     assert!(concept.contains("content_hash: blake3:auth"));
     assert!(concept.contains("[^evidence-65762d61757468]"));
     assert!(!concept.contains("verified:"));
+}
+
+#[test]
+fn emits_and_verifies_japanese_display_text_with_stable_machine_fields() {
+    let temp = TempDir::new().unwrap();
+    let mut snapshot = snapshot();
+    snapshot.output_locale = OutputLocale::Ja;
+
+    emit_okf(&snapshot, temp.path()).unwrap();
+
+    let index = fs::read_to_string(temp.path().join("index.md")).unwrap();
+    assert!(index.contains("output_locale: ja"));
+    assert!(index.contains("## カバレッジ"));
+    assert!(index.contains("- 収録済み: 1"));
+    assert!(index.contains("- 除外: 0"));
+    assert!(index.contains("- 未解決: 0"));
+
+    let concept = fs::read_to_string(temp.path().join("modules/auth.md")).unwrap();
+    assert!(concept.contains("type: Module"));
+    assert!(concept.contains("output_locale: ja"));
+    assert!(concept.contains("## 証拠に紐づく主張"));
+    assert!(concept.contains("ソース上の証拠 ev-auth"));
+    assert!(concept.contains("id: validates-credentials"));
+
+    let options = VerifyOptions {
+        expected_output_locale: Some(OutputLocale::Ja),
+        ..VerifyOptions::default()
+    };
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &options,
+    );
+    assert!(report.valid, "{:#?}", report.issues);
+
+    let mismatch = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &VerifyOptions {
+            expected_output_locale: Some(OutputLocale::En),
+            ..VerifyOptions::default()
+        },
+    );
+    assert!(mismatch.has_code("output-locale-mismatch"));
+
+    let concept_path = temp.path().join("modules/auth.md");
+    let concept_without_locale =
+        fs::read_to_string(&concept_path)
+            .unwrap()
+            .replacen("  output_locale: ja\n", "", 1);
+    fs::write(&concept_path, concept_without_locale).unwrap();
+    let missing = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &options,
+    );
+    assert!(missing.has_code("missing-output-locale"));
+}
+
+#[test]
+fn expected_locale_rejects_a_missing_root_index() {
+    let temp = TempDir::new().unwrap();
+    let snapshot = snapshot();
+    emit_okf(&snapshot, temp.path()).unwrap();
+    fs::remove_file(temp.path().join("index.md")).unwrap();
+
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &VerifyOptions {
+            expected_output_locale: Some(OutputLocale::En),
+            ..VerifyOptions::default()
+        },
+    );
+
+    assert!(!report.valid);
+    assert!(report.has_code("missing-output-locale"));
+    assert!(report.issues.iter().any(|issue| {
+        issue.code == "missing-output-locale" && issue.document.as_deref() == Some("index.md")
+    }));
+}
+
+#[test]
+fn expected_locale_rejects_root_index_without_frontmatter() {
+    let temp = TempDir::new().unwrap();
+    let snapshot = snapshot();
+    emit_okf(&snapshot, temp.path()).unwrap();
+    fs::write(temp.path().join("index.md"), "# demo\n").unwrap();
+
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &VerifyOptions {
+            expected_output_locale: Some(OutputLocale::En),
+            ..VerifyOptions::default()
+        },
+    );
+
+    assert!(!report.valid);
+    assert!(report.has_code("missing-output-locale"));
+}
+
+#[test]
+fn expected_locale_rejects_a_tampered_root_declaration() {
+    let temp = TempDir::new().unwrap();
+    let snapshot = snapshot();
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let index_path = temp.path().join("index.md");
+    let tampered = fs::read_to_string(&index_path).unwrap().replacen(
+        "  output_locale: en\n",
+        "  output_locale: ja\n",
+        1,
+    );
+    fs::write(index_path, tampered).unwrap();
+
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &VerifyOptions {
+            expected_output_locale: Some(OutputLocale::En),
+            ..VerifyOptions::default()
+        },
+    );
+
+    assert!(!report.valid);
+    assert!(report.issues.iter().any(|issue| {
+        issue.code == "output-locale-mismatch" && issue.document.as_deref() == Some("index.md")
+    }));
+}
+
+#[test]
+fn expected_locale_rejects_mixed_concept_declarations() {
+    let temp = TempDir::new().unwrap();
+    let snapshot = semantic_snapshot();
+    emit_okf(&snapshot, temp.path()).unwrap();
+    let data_path = temp.path().join("modules/data.md");
+    let tampered = fs::read_to_string(&data_path).unwrap().replacen(
+        "  output_locale: en\n",
+        "  output_locale: ja\n",
+        1,
+    );
+    fs::write(data_path, tampered).unwrap();
+
+    let report = verify_okf(
+        temp.path(),
+        &snapshot.evidence,
+        &snapshot.coverage,
+        &VerifyOptions {
+            expected_output_locale: Some(OutputLocale::En),
+            semantic_inventory: snapshot.semantic_inventory.clone(),
+            ..VerifyOptions::default()
+        },
+    );
+
+    assert!(!report.valid);
+    let mismatches = report
+        .issues
+        .iter()
+        .filter(|issue| issue.code == "output-locale-mismatch")
+        .collect::<Vec<_>>();
+    assert_eq!(mismatches.len(), 1, "{:#?}", report.issues);
+    assert_eq!(mismatches[0].document.as_deref(), Some("modules/data.md"));
 }
 
 #[test]
@@ -466,6 +635,7 @@ fn architecture_scope_is_emitted_and_verified_exactly() {
         at: None,
     });
     snapshot.documents[0].metadata.repo2okf = Some(Repo2OkfMetadata {
+        output_locale: Some(OutputLocale::En),
         claims: Vec::new(),
         relationships: Vec::new(),
         architecture: Some(OkfArchitectureConcept {

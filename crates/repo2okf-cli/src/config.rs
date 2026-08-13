@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use repo2okf_core::OutputLocale;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONFIG_FILE: &str = "repo2okf.toml";
@@ -65,6 +66,7 @@ pub struct OutputConfig {
     pub directory: PathBuf,
     pub ir_file: PathBuf,
     pub state_file: PathBuf,
+    pub locale: OutputLocale,
 }
 
 impl Default for OutputConfig {
@@ -73,6 +75,7 @@ impl Default for OutputConfig {
             directory: PathBuf::from(".okf"),
             ir_file: PathBuf::from(".repo2okf/ir.json"),
             state_file: PathBuf::from(".repo2okf/state.json"),
+            locale: OutputLocale::En,
         }
     }
 }
@@ -249,6 +252,8 @@ pub(crate) fn is_reserved_state_path(path: &Path) -> bool {
 mod tests {
     use std::{fs, path::Path};
 
+    use repo2okf_core::OutputLocale;
+
     use super::{Config, MAX_CONFIG_BYTES};
 
     #[test]
@@ -257,8 +262,10 @@ mod tests {
         config.validate().expect("default should be valid");
         assert!(config.scan.languages.iter().any(|value| value == "python"));
         let encoded = toml::to_string(&config).expect("serialize config");
+        assert!(encoded.contains("locale = \"en\""));
         let decoded: Config = toml::from_str(&encoded).expect("deserialize config");
         decoded.validate().expect("round-trip should be valid");
+        assert_eq!(decoded.output.locale, OutputLocale::En);
     }
 
     #[test]
@@ -266,6 +273,17 @@ mod tests {
         let error = toml::from_str::<Config>("schema = 1\nunknown = true")
             .expect_err("unknown field should fail");
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn accepts_supported_output_locales_and_rejects_unknown_values() {
+        let japanese: Config =
+            toml::from_str("[output]\nlocale = \"ja\"\n").expect("Japanese locale");
+        assert_eq!(japanese.output.locale, OutputLocale::Ja);
+
+        let error = toml::from_str::<Config>("[output]\nlocale = \"fr\"\n")
+            .expect_err("unsupported locale should fail");
+        assert!(error.to_string().contains("unknown variant"));
     }
 
     #[test]
