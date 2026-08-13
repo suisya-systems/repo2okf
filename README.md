@@ -9,13 +9,21 @@ CLI and existing login.
 
 ## Quick start
 
-Until the first binary release, install from source with Rust 1.88 or newer:
+Install the current pre-release with the platform installer:
 
-```console
-git clone https://github.com/suisya-systems/repo2okf.git
-cd repo2okf
-cargo install --path crates/repo2okf-cli --locked
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.1/repo2okf-installer.sh | sh
 ```
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.1/repo2okf-installer.ps1 | iex"
+```
+
+Windows, macOS and Linux archives are also attached to the
+[`v0.1.0-alpha.1` pre-release](https://github.com/suisya-systems/repo2okf/releases/tag/v0.1.0-alpha.1).
+Source builds require Rust 1.88 or newer; see the
+[distribution guide](docs/distribution.md).
 
 Run it in the repository you want to document:
 
@@ -102,7 +110,7 @@ The workspace contains four crates:
 - `repo2okf-core`: scanning, IR, evidence, and coverage
 - `repo2okf-agent`: Codex and Claude Code adapters
 - `repo2okf-format`: OKF emission and verification
-- `repo2okf-cli`: configuration and commands
+- `repo2okf`: configuration and commands (`crates/repo2okf-cli`)
 
 See the [distribution guide](docs/distribution.md) for supported release
 targets. Contributions are described in [CONTRIBUTING.md](CONTRIBUTING.md).

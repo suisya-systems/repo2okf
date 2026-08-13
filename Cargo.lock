@@ -592,23 +592,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "repo2okf-agent"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "repo2okf-core",
- "schemars",
- "semver",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "which",
-]
-
-[[package]]
-name = "repo2okf-cli"
-version = "0.1.0"
+name = "repo2okf"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -627,8 +612,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "repo2okf-agent"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "blake3",
+ "repo2okf-core",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "which",
+]
+
+[[package]]
 name = "repo2okf-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
  "ignore",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "repo2okf-format"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
  "chrono",

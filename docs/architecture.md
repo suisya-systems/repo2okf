@@ -24,8 +24,9 @@ repository
   prompts and the bounded enrichment/repair loop. It may depend on core.
 - `repo2okf-format` owns OKF v0.2 documents, deterministic emission and
   verification. It may depend on core.
-- `repo2okf-cli` owns configuration, commands, orchestration and user-facing
-  diagnostics. It may depend on every library crate.
+- `repo2okf` (`crates/repo2okf-cli`) owns configuration, commands,
+  orchestration and user-facing diagnostics. It may depend on every library
+  crate.
 
 ## Required invariants
 

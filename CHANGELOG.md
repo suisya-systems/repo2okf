@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-alpha.1] - 2026-08-13
+
+First dogfood pre-release. Commands, output details, and Rust APIs may change.
+Release artifacts include checksums and GitHub attestations, but are not yet
+code-signed or notarized.
+
 ### Added
 
 - Initial Rust workspace and cross-platform CI.
@@ -39,3 +45,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dependencies to their current compatible releases.
 - Raised the source-build MSRV to Rust 1.88 and grouped routine Dependabot
   updates by ecosystem to avoid one pull request per dependency.
+
+[Unreleased]: https://github.com/suisya-systems/repo2okf/compare/v0.1.0-alpha.1...HEAD
+[0.1.0-alpha.1]: https://github.com/suisya-systems/repo2okf/releases/tag/v0.1.0-alpha.1
