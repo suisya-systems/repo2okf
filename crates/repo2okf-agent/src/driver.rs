@@ -757,6 +757,9 @@ mod tests {
     };
     use crate::EvidenceExcerpt;
 
+    #[cfg(windows)]
+    static FAKE_CLI_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn decodes_plain_structured_response() {
         let decoded = decode_response(
@@ -1175,12 +1178,22 @@ mod tests {
     }
 
     struct FakeCli {
+        // Starting several PowerShell processes concurrently can exceed the
+        // deliberately short probe timeout on loaded Windows CI runners.
+        // Keep the process-level contract tests independent without weakening
+        // the production timeout.
+        #[cfg(windows)]
+        _process_guard: std::sync::MutexGuard<'static, ()>,
         repository: tempfile::TempDir,
         executable: PathBuf,
     }
 
     impl FakeCli {
         fn new(vendor: &str) -> Self {
+            #[cfg(windows)]
+            let process_guard = FAKE_CLI_PROCESS_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let repository = tempfile::tempdir().expect("fixture repository");
             let bin = repository.path().join("bin");
             fs::create_dir(&bin).expect("fixture bin directory");
@@ -1191,6 +1204,8 @@ mod tests {
             )
             .expect("auth sentinel");
             Self {
+                #[cfg(windows)]
+                _process_guard: process_guard,
                 repository,
                 executable,
             }
