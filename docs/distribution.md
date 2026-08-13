@@ -19,10 +19,27 @@ The cargo-dist configuration builds these native targets:
 Shell and PowerShell installers are generated from the same versioned release
 archives. GitHub artifact attestations are enabled in `dist-workspace.toml`.
 
-## Install from a checkout
+## Install the pre-release
 
-Until the first hosted release is published, install directly from a checkout
-with Rust 1.88 or newer:
+The current dogfood release is `v0.1.0-alpha.1`. Install it without a Rust
+toolchain:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.1/repo2okf-installer.sh | sh
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/suisya-systems/repo2okf/releases/download/v0.1.0-alpha.1/repo2okf-installer.ps1 | iex"
+```
+
+The release page also provides archives, SHA-256 checksums, and GitHub artifact
+attestations for all supported targets. This alpha is not code-signed or
+notarized. The installer is provided for convenience; when provenance matters,
+verify a downloaded artifact with
+`gh attestation verify <file> --repo suisya-systems/repo2okf` and its checksum.
+
+To build from a checkout instead, use Rust 1.88 or newer:
 
 ```console
 cargo install --path crates/repo2okf-cli --locked
@@ -34,14 +51,14 @@ or API key.
 
 ## Publishing checklist
 
-Before the first hosted release:
+For each hosted release:
 
-1. Enable private vulnerability reporting and verify its URL in the issue-template
-   contact links.
-2. Install cargo-dist 0.32 and run `dist init --yes` to generate its GitHub
-   release workflow from the checked-in `dist-workspace.toml`.
+1. Confirm private vulnerability reporting and the issue-template contact URL.
+2. Run `dist generate --check` with cargo-dist 0.32.
 3. Run formatting, Clippy, all workspace tests, documentation and cargo-deny.
-4. Inspect the generated release plan for all five targets and both installers.
+4. Inspect `dist plan` for all five targets and both installers.
+5. Push the single matching version tag only after the release workflow is on
+   the default branch.
 
 The canonical source repository is
 [`suisya-systems/repo2okf`](https://github.com/suisya-systems/repo2okf).

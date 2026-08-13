@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: Repo2OKF version
-      placeholder: repo2okf 0.1.0
+      placeholder: repo2okf 0.1.0-alpha.1
     validations:
       required: true
   - type: dropdown

@@ -11,7 +11,7 @@ homepage.workspace = true
 
 [dependencies]
 blake3.workspace = true
-repo2okf-core = { version = "0.1.0", path = "../repo2okf-core" }
+repo2okf-core = { version = "0.1.0-alpha.1", path = "../repo2okf-core" }
 schemars.workspace = true
 semver.workspace = true
 serde.workspace = true

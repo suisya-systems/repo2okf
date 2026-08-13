@@ -1,5 +1,5 @@
 [package]
-name = "repo2okf-cli"
+name = "repo2okf"
 description = "Evidence-bound repository-to-OKF compiler"
 version.workspace = true
 edition.workspace = true
@@ -17,9 +17,9 @@ path = "src/main.rs"
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
-repo2okf-agent = { version = "0.1.0", path = "../repo2okf-agent" }
-repo2okf-core = { version = "0.1.0", path = "../repo2okf-core" }
-repo2okf-format = { version = "0.1.0", path = "../repo2okf-format" }
+repo2okf-agent = { version = "0.1.0-alpha.1", path = "../repo2okf-agent" }
+repo2okf-core = { version = "0.1.0-alpha.1", path = "../repo2okf-core" }
+repo2okf-format = { version = "0.1.0-alpha.1", path = "../repo2okf-format" }
 serde.workspace = true
 serde_json.workspace = true
 same-file.workspace = true
